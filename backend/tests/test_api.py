@@ -98,6 +98,11 @@ def test_admin_can_manage_places_and_regular_user_cannot() -> None:
         places = client.get("/api/admin/places", headers=admin_headers)
         assert places.status_code == 200
         assert len(places.json()) >= 25
+        users = client.get("/api/admin/users", headers=admin_headers)
+        assert users.status_code == 200
+        dependency_counts = {"owned_plan_count", "note_count", "image_count", "appeal_count"}
+        assert users.json()
+        assert all(dependency_counts <= set(user) for user in users.json())
 
 
 def test_global_exploration_and_grounded_chat_history() -> None:

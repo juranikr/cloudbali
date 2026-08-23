@@ -153,6 +153,12 @@ def test_admin_user_lifecycle_hashes_password_and_blocks_self_delete() -> None:
             json={"content": "삭제 전에 보존해야 하는 사용자 메모"},
         )
         assert protected_note.status_code == 201
+        listed = client.get("/api/admin/users", headers=headers(1))
+        listed_user = next(item for item in listed.json() if item["id"] == created_body["id"])
+        assert listed_user["note_count"] == 1
+        assert listed_user["owned_plan_count"] == 0
+        assert listed_user["image_count"] == 0
+        assert listed_user["appeal_count"] == 0
         blocked = client.delete(f"/api/admin/users/{created_body['id']}", headers=headers(1))
         assert blocked.status_code == 409
         assert "사용자 콘텐츠 보존" in blocked.json()["detail"]

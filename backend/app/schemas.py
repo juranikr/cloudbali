@@ -115,17 +115,6 @@ class AdminPlaceUpdate(BaseModel):
         return self
 
 
-class AdminUserOut(BaseModel):
-    id: int
-    email: str
-    display_name: str
-    place_count: int
-    favorite_count: int
-    trip_stop_count: int
-    is_admin: bool
-    created_at: datetime
-
-
 class PlaceOut(BaseModel):
     id: int
     region_id: int

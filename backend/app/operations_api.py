@@ -304,7 +304,7 @@ def _require_owner_or_admin(owner_id: int, user: User) -> None:
         raise HTTPException(status_code=403, detail="본인이 등록한 항목만 관리할 수 있습니다")
 
 
-def _admin_user_out(db: Session, row: User) -> AdminUserOut:
+def admin_user_out(db: Session, row: User) -> AdminUserOut:
     return AdminUserOut(
         id=row.id,
         email=row.email,
@@ -436,6 +436,15 @@ def record_place_change_event(
     return row
 
 
+@router.get("/api/admin/users", response_model=list[AdminUserOut])
+def admin_users(
+    db: Session = Depends(get_db),
+    _: User = Depends(get_admin_user),
+) -> list[AdminUserOut]:
+    rows = db.query(User).order_by(User.created_at, User.id).all()
+    return [admin_user_out(db, row) for row in rows]
+
+
 @router.post("/api/admin/users", response_model=AdminUserOut, status_code=status.HTTP_201_CREATED)
 def admin_create_user(
     body: AdminUserCreate,
@@ -457,7 +466,7 @@ def admin_create_user(
         db.rollback()
         raise HTTPException(status_code=409, detail="이미 등록된 이메일입니다") from exc
     db.refresh(row)
-    return _admin_user_out(db, row)
+    return admin_user_out(db, row)
 
 
 @router.patch("/api/admin/users/{user_id}", response_model=AdminUserOut)
@@ -476,7 +485,7 @@ def admin_update_user(
         row.password_hash = hash_password(body.password)
     db.commit()
     db.refresh(row)
-    return _admin_user_out(db, row)
+    return admin_user_out(db, row)
 
 
 @router.delete("/api/admin/users/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -485,7 +494,7 @@ def admin_delete_user(
     db: Session = Depends(get_db),
     admin: User = Depends(get_admin_user),
 ) -> Response:
-    row = db.get(User, user_id)
+    row = db.query(User).filter(User.id == user_id).with_for_update().first()
     if row is None:
         raise HTTPException(status_code=404, detail="계정을 찾을 수 없습니다")
     if row.id == admin.id:

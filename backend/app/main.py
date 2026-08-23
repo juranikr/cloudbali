@@ -27,7 +27,6 @@ from app.batch import run_batch
 from app.models import BatchRun, ChatMessage, Favorite, Place, Region, RegionSnapshot, TripStop, User
 from app.schemas import (
     AdminPlaceUpdate,
-    AdminUserOut,
     BatchRunOut,
     ChatMessageOut,
     ChatRequest,
@@ -590,27 +589,6 @@ def admin_run_batch(
     db: Session = Depends(get_db),
 ) -> BatchRunOut:
     return BatchRunOut.model_validate(run_batch(db, trigger="manual"))
-
-
-@app.get("/api/admin/users", response_model=list[AdminUserOut])
-def admin_users(
-    _: User = Depends(get_admin_user),
-    db: Session = Depends(get_db),
-) -> list[AdminUserOut]:
-    rows = db.query(User).order_by(User.created_at, User.id).all()
-    return [
-        AdminUserOut(
-            id=row.id,
-            email=row.email,
-            display_name=row.display_name,
-            place_count=db.query(func.count(Place.id)).filter(Place.creator_id == row.id).scalar() or 0,
-            favorite_count=db.query(func.count(Favorite.id)).filter(Favorite.user_id == row.id).scalar() or 0,
-            trip_stop_count=db.query(func.count(TripStop.id)).filter(TripStop.user_id == row.id).scalar() or 0,
-            is_admin=row.email.lower() in settings.admin_email_list,
-            created_at=row.created_at,
-        )
-        for row in rows
-    ]
 
 
 @app.get("/api/admin/places", response_model=list[PlaceOut])
