@@ -1,0 +1,27 @@
+name: patra-local
+
+services:
+  app:
+    build:
+      context: .
+      args:
+        VITE_APP_NAME: PATRA
+    environment:
+      APP_NAME: PATRA
+      JWT_SECRET: local-only-change-before-production
+      CORS_ORIGINS: http://localhost:18000,http://127.0.0.1:18000
+      GEOCODER_USER_AGENT: patra-local-development/0.1
+      DATABASE_URL: sqlite:////app/data/patra.db
+    ports:
+      - "127.0.0.1:18000:8000"
+    volumes:
+      - patra_local_data:/app/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import json,urllib.request; assert json.load(urllib.request.urlopen('http://127.0.0.1:8000/api/health'))['status'] == 'ok'"]
+      interval: 5s
+      timeout: 4s
+      retries: 20
+      start_period: 8s
+
+volumes:
+  patra_local_data:

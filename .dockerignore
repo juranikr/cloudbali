@@ -1,0 +1,13 @@
+.git
+.gitignore
+.venv
+**/__pycache__
+**/*.pyc
+backend/.pytest_cache
+backend/*.db
+frontend/node_modules
+frontend/dist
+infra/.terraform
+infra/*.plan
+infra/plan.out
+infra/*.tfstate*
