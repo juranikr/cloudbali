@@ -7,6 +7,8 @@
 ## 운영 서비스
 
 - 주소: https://d99vh81lujruy.cloudfront.net
+- GitHub: https://github.com/juranikr/cloudbali
+- 자동 배포: `main` 브랜치의 앱 코드 변경 시 테스트 → ECR 이미지 푸시 → ECS 무중단 교체 → 운영 헬스체크
 - 일반 계정: `tjwjd629@naver.com`
 - 관리자 계정: `joohan92@naver.com`
 - 비밀번호: 각 계정의 기존 Cloudmiddle 비밀번호와 동일하며 저장소에는 기록하지 않습니다.
@@ -57,6 +59,7 @@ npm run dev
 - 즐겨찾기와 여러 섬을 고려한 DAY 일정
 - 지도 장소·선택 지역·내 일정을 근거로 답하는 여행 채팅
 - 6시간마다 Open-Meteo 권역 날씨와 장소 정합성을 갱신하는 ECS 배치
+- 배치 성공·실패와 처리 건수를 남기는 관리자 실행 이력
 - 관리자 통계, 사용자 조회, 장소 검색·수정·삭제, 배치 이력·수동 실행
 - 모바일 반응형 지도와 지역별 교통 경고
 
