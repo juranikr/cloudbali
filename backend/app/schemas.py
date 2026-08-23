@@ -332,8 +332,25 @@ class DiscoveryCandidateOut(BaseModel):
     updated_at: datetime
 
 
+class DiscoveryFetchErrorOut(BaseModel):
+    endpoint: str | None
+    error_type: str
+    status_code: int | None
+    message: str
+    segment: str
+    attempt: int
+
+
+class DiscoveryRegionFailureOut(BaseModel):
+    region_id: int
+    region_name: str
+    attempts: int
+    errors: list[DiscoveryFetchErrorOut]
+
+
 class DiscoveryRunOut(BaseModel):
     run: BatchRunOut
     created_count: int
     duplicate_count: int
     invalid_count: int
+    failures: list[DiscoveryRegionFailureOut] = Field(default_factory=list)

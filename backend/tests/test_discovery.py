@@ -1,10 +1,14 @@
 import json
 import os
 import tempfile
+from collections import Counter
 from datetime import datetime, timedelta, timezone
+from io import BytesIO
 from types import SimpleNamespace
 from unittest.mock import patch
+from urllib.error import HTTPError
 
+import pytest
 from sqlalchemy import event
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -19,10 +23,21 @@ from fastapi.testclient import TestClient
 from app.db import SessionLocal
 from app.main import app
 from app.discovery import (
+    DiscoveryFetchError,
+    DiscoveryRegionSnapshot,
+    DiscoveryRegionFailure,
+    OverpassRequestError,
     _candidate_values,
     _claim_discovery_run,
+    _deserialize_failure_details,
+    _fetch_region_with_retry,
     _locked_active_places_by_region,
+    _overpass_segments,
+    _serialize_failure_details,
+    _sleep_before_fetch_retry,
     create_discovery_run,
+    execute_discovery_run,
+    fetch_osm_elements,
     get_discovery_run,
     inactive_place_reason,
     prepare_discovery_retry,
@@ -363,6 +378,454 @@ def test_discovery_persists_an_expanding_scan_window() -> None:
             _completed_run(client, admin, second)
 
     assert requested[:2] == [(20, 0), (40, 0)]
+
+
+@pytest.mark.parametrize("slug", ["east-bali", "nusa-penida"])
+def test_heavy_region_fetch_splits_limit_across_tiles_and_deduplicates_osm_ids(
+    slug: str,
+) -> None:
+    region = SimpleNamespace(
+        slug=slug,
+        south=-8.84,
+        west=115.42,
+        north=-8.24,
+        east=115.72,
+    )
+    calls: list[tuple[int, int, str]] = []
+
+    def tile_result(_region, limit: int, phase: int, segment) -> list[dict]:
+        calls.append((limit, phase, segment.name))
+        unique_id = len(calls) + 100
+        return [
+            {"type": "node", "id": 100},
+            {"type": "node", "id": unique_id},
+        ][:limit]
+
+    with patch("app.discovery._fetch_osm_segment", side_effect=tile_result):
+        elements = fetch_osm_elements(region, 10, 2)
+
+    segments = _overpass_segments(region, 2)
+    assert len(segments) == 4
+    assert sum(limit for limit, _, _ in calls) == 10
+    assert [limit for limit, _, _ in calls] == [3, 3, 2, 2]
+    assert all(phase == 2 and name.endswith(":phase-2") for _, phase, name in calls)
+    assert segments[0].south == region.south
+    assert segments[0].west == region.west
+    assert segments[-1].north == region.north
+    assert segments[-1].east == region.east
+    assert [(element["type"], element["id"]) for element in elements].count(("node", 100)) == 1
+    assert len(elements) == 5
+
+
+def test_split_region_retries_the_whole_bounded_tile_set_after_partial_failure() -> None:
+    region = SimpleNamespace(
+        id=808,
+        slug="nusa-penida",
+        name_ko="누사 페니다",
+        south=-8.84,
+        west=115.42,
+        north=-8.64,
+        east=115.66,
+    )
+    calls: Counter[str] = Counter()
+    segment_ids: dict[str, int] = {}
+
+    def partially_flaky(_region, _limit: int, _phase: int, segment) -> list[dict]:
+        calls[segment.name] += 1
+        segment_ids.setdefault(segment.name, len(segment_ids) + 1)
+        if "tile-1-2/" in segment.name and calls[segment.name] == 1:
+            raise OverpassRequestError([
+                DiscoveryFetchError(
+                    endpoint="https://overpass-api.de/api/interpreter",
+                    error_type="HTTPError",
+                    status_code=504,
+                    message="Gateway Timeout",
+                    segment=segment.name,
+                )
+            ])
+        return [{"type": "node", "id": segment_ids[segment.name]}]
+
+    with (
+        patch("app.discovery._fetch_osm_segment", side_effect=partially_flaky),
+        patch("app.discovery._sleep_before_fetch_retry") as retry_sleep,
+    ):
+        elements, failure = _fetch_region_with_retry(region, 8, 0)
+
+    assert failure is None
+    assert elements is not None and len(elements) == 4
+    assert calls["tile-1-1/2x2:phase-0"] == 2
+    assert calls["tile-1-2/2x2:phase-0"] == 2
+    assert calls["tile-2-1/2x2:phase-0"] == 1
+    assert calls["tile-2-2/2x2:phase-0"] == 1
+    retry_sleep.assert_called_once_with(1)
+
+
+def test_region_retry_uses_exponential_backoff_with_jitter() -> None:
+    with (
+        patch("app.discovery.random.uniform", side_effect=lambda _low, high: high) as jitter,
+        patch("app.discovery.time.sleep") as sleep,
+    ):
+        _sleep_before_fetch_retry(1)
+        _sleep_before_fetch_retry(2)
+
+    assert jitter.call_args_list[0].args == (2.0, 2.5)
+    assert jitter.call_args_list[1].args == (4.0, 5.0)
+    assert [call.args[0] for call in sleep.call_args_list] == [2.5, 5.0]
+
+
+@pytest.mark.parametrize(
+    "deterministic_error",
+    [
+        ValueError("invalid bbox"),
+        TypeError("invalid provider payload"),
+        OverpassRequestError([
+            DiscoveryFetchError(
+                endpoint="https://overpass-api.de/api/interpreter",
+                error_type="ValueError",
+                status_code=None,
+                message="elements must be an array",
+                segment="full:phase-0",
+            )
+        ]),
+        OverpassRequestError([
+            DiscoveryFetchError(
+                endpoint="https://overpass-api.de/api/interpreter",
+                error_type="HTTPError",
+                status_code=400,
+                message="Bad Request",
+                segment="full:phase-0",
+            )
+        ]),
+    ],
+    ids=["value-error", "type-error", "wrapped-value-error", "http-400"],
+)
+def test_deterministic_fetch_errors_are_not_retried(
+    deterministic_error: Exception,
+) -> None:
+    region = SimpleNamespace(
+        id=707,
+        slug="ubud",
+        name_ko="우붓",
+        south=-8.58,
+        west=115.20,
+        north=-8.40,
+        east=115.36,
+    )
+    with (
+        patch("app.discovery.fetch_osm_elements", side_effect=deterministic_error) as fetch,
+        patch("app.discovery._sleep_before_fetch_retry") as retry_sleep,
+    ):
+        elements, failure = _fetch_region_with_retry(region, 20, 0)
+
+    assert elements is None
+    assert failure is not None
+    assert failure.attempts == 1
+    assert all(error.attempt == 1 for error in failure.errors)
+    fetch.assert_called_once_with(region, 20, 0)
+    retry_sleep.assert_not_called()
+
+
+def test_provider_io_runs_after_transaction_release_with_immutable_region_snapshot() -> None:
+    observations: list[tuple[bool, bool]] = []
+
+    with TestClient(app):
+        with SessionLocal() as db:
+            region = db.query(Region).filter(Region.slug == "ubud").one()
+            queued = create_discovery_run(db, region_id=region.id, limit=1)
+
+            def inspect_fetch(fetch_region, _limit: int, _phase: int) -> list[dict]:
+                # The executor's main thread is waiting and does not touch this
+                # Session until the future completes, so this read-only probe
+                # directly verifies that the snapshot transaction was ended.
+                observations.append(
+                    (db.in_transaction(), isinstance(fetch_region, DiscoveryRegionSnapshot))
+                )
+                return []
+
+            with patch("app.discovery.fetch_osm_elements", side_effect=inspect_fetch):
+                completed = execute_discovery_run(db, queued.run.id)
+
+    assert completed.run.status == "success"
+    assert observations == [(False, True)]
+
+
+def test_only_failed_region_is_retried_and_scan_state_advances_once() -> None:
+    calls: Counter[str] = Counter()
+
+    def flaky_ubud(region, _limit: int, _phase: int) -> list[dict]:
+        assert isinstance(region, DiscoveryRegionSnapshot)
+        calls[region.slug] += 1
+        if region.slug == "ubud" and calls[region.slug] < 3:
+            raise TimeoutError("temporary Overpass timeout")
+        return []
+
+    with TestClient(app) as client:
+        admin = _login(client, "joohan92@naver.com", "admin-test-password")
+        regions = client.get("/api/regions", headers=admin).json()
+        region_ids = [region["id"] for region in regions]
+        with SessionLocal() as db:
+            before = {
+                state.region_id: state.scan_count
+                for state in db.query(DiscoveryScanState)
+                .filter(DiscoveryScanState.region_id.in_(region_ids))
+                .all()
+            }
+        with (
+            patch("app.discovery.fetch_osm_elements", side_effect=flaky_ubud),
+            patch("app.discovery._sleep_before_fetch_retry") as retry_sleep,
+        ):
+            queued = client.post(
+                "/api/admin/discovery/run",
+                headers=admin,
+                json={"limit": 200},
+            )
+        completed = _completed_run(client, admin, queued)
+        with SessionLocal() as db:
+            after = {
+                state.region_id: state.scan_count
+                for state in db.query(DiscoveryScanState)
+                .filter(DiscoveryScanState.region_id.in_(region_ids))
+                .all()
+            }
+
+    assert completed["run"]["status"] == "success"
+    assert completed["failures"] == []
+    assert calls["ubud"] == 3
+    assert all(calls[region["slug"]] == (3 if region["slug"] == "ubud" else 1) for region in regions)
+    assert all(after[region_id] == before.get(region_id, 0) + 1 for region_id in region_ids)
+    assert retry_sleep.call_count == 2
+
+
+def test_http_failures_keep_safe_endpoint_status_segment_and_attempt_details() -> None:
+    region = SimpleNamespace(
+        slug="ubud",
+        south=-8.58,
+        west=115.20,
+        north=-8.40,
+        east=115.36,
+    )
+    provider_body = BytesIO(b"<html>internal provider diagnostics</html>")
+    errors = [
+        HTTPError(
+            "https://overpass-api.de/api/interpreter",
+            504,
+            "Gateway Timeout",
+            None,
+            provider_body,
+        ),
+        HTTPError(
+            "https://overpass.kumi.systems/api/interpreter",
+            500,
+            "Internal Server Error",
+            None,
+            None,
+        ),
+    ]
+
+    with patch("app.discovery.urlopen", side_effect=errors):
+        with pytest.raises(OverpassRequestError) as raised:
+            fetch_osm_elements(region, 20, 1)
+
+    details = raised.value.errors
+    assert [detail.status_code for detail in details] == [504, 500]
+    assert [detail.endpoint for detail in details] == [
+        "https://overpass-api.de/api/interpreter",
+        "https://overpass.kumi.systems/api/interpreter",
+    ]
+    assert all(detail.error_type == "HTTPError" for detail in details)
+    assert all(detail.segment == "full:phase-1" for detail in details)
+    assert "internal provider diagnostics" not in " ".join(detail.message for detail in details)
+
+
+def test_persistent_region_failure_is_serialized_in_database_and_api() -> None:
+    endpoint_errors = [
+        DiscoveryFetchError(
+            endpoint="https://overpass-api.de/api/interpreter",
+            error_type="HTTPError",
+            status_code=504,
+            message="Gateway Timeout",
+            segment="tile-1-1/2x2:phase-0",
+        ),
+        DiscoveryFetchError(
+            endpoint="https://overpass.kumi.systems/api/interpreter",
+            error_type="HTTPError",
+            status_code=500,
+            message="Internal Server Error",
+            segment="tile-1-1/2x2:phase-0",
+        ),
+    ]
+
+    with TestClient(app) as client:
+        admin = _login(client, "joohan92@naver.com", "admin-test-password")
+        regions = client.get("/api/regions", headers=admin).json()
+        east_bali = next(region for region in regions if region["slug"] == "east-bali")
+        with (
+            patch(
+                "app.discovery.fetch_osm_elements",
+                side_effect=OverpassRequestError(endpoint_errors),
+            ),
+            patch("app.discovery._sleep_before_fetch_retry"),
+        ):
+            queued = client.post(
+                "/api/admin/discovery/run",
+                headers=admin,
+                json={"region_id": east_bali["id"], "limit": 20},
+            )
+        completed = _completed_run(client, admin, queued)
+        with SessionLocal() as db:
+            job = db.get(DiscoveryJob, completed["run"]["id"])
+            assert job is not None
+            stored_failures = json.loads(job.failure_details)
+
+    assert completed["run"]["status"] == "failed"
+    assert len(completed["failures"]) == 1
+    failure = completed["failures"][0]
+    assert failure["region_id"] == east_bali["id"]
+    assert failure["region_name"] == "아메드·동부 발리"
+    assert failure["attempts"] == 3
+    assert [error["attempt"] for error in failure["errors"]] == [1, 1, 2, 2, 3, 3]
+    assert [error["status_code"] for error in failure["errors"]] == [504, 500] * 3
+    assert stored_failures == completed["failures"]
+    assert "HTTP 500" in completed["run"]["summary"]
+
+
+def test_partial_run_preserves_success_and_advances_only_successful_scan_state() -> None:
+    successful_element = _osm_element(
+        891_234_567,
+        title="Partial Run Preserved Garden",
+        lat=-8.52,
+        lng=115.28,
+    )
+    calls: Counter[str] = Counter()
+
+    def mixed_provider_result(region, _limit: int, phase: int) -> list[dict]:
+        assert isinstance(region, DiscoveryRegionSnapshot)
+        calls[region.slug] += 1
+        if region.slug == "east-bali":
+            raise OverpassRequestError([
+                DiscoveryFetchError(
+                    endpoint="https://overpass-api.de/api/interpreter",
+                    error_type="HTTPError",
+                    status_code=504,
+                    message="Gateway Timeout",
+                    segment=f"tile-1-1/2x2:phase-{phase}",
+                )
+            ])
+        if region.slug == "ubud":
+            return [successful_element]
+        return []
+
+    with TestClient(app) as client:
+        admin = _login(client, "joohan92@naver.com", "admin-test-password")
+        regions = client.get("/api/regions", headers=admin).json()
+        ubud = next(region for region in regions if region["slug"] == "ubud")
+        east_bali = next(region for region in regions if region["slug"] == "east-bali")
+        target_ids = [ubud["id"], east_bali["id"]]
+        with SessionLocal() as db:
+            before = {
+                state.region_id: state.scan_count
+                for state in db.query(DiscoveryScanState)
+                .filter(DiscoveryScanState.region_id.in_(target_ids))
+                .all()
+            }
+        with (
+            patch("app.discovery.fetch_osm_elements", side_effect=mixed_provider_result),
+            patch("app.discovery._sleep_before_fetch_retry") as retry_sleep,
+        ):
+            queued = client.post(
+                "/api/admin/discovery/run",
+                headers=admin,
+                json={"limit": 200},
+            )
+        completed = _completed_run(client, admin, queued)
+        with SessionLocal() as db:
+            after = {
+                state.region_id: state.scan_count
+                for state in db.query(DiscoveryScanState)
+                .filter(DiscoveryScanState.region_id.in_(target_ids))
+                .all()
+            }
+            candidate = (
+                db.query(DiscoveryCandidate)
+                .filter(DiscoveryCandidate.external_id == "node/891234567")
+                .one()
+            )
+            job = db.get(DiscoveryJob, completed["run"]["id"])
+            assert job is not None
+            stored_failures = json.loads(job.failure_details)
+
+    assert completed["run"]["status"] == "partial"
+    assert completed["created_count"] == 1
+    assert completed["run"]["scanned_count"] == 1
+    assert candidate.discovery_run_id == completed["run"]["id"]
+    assert candidate.region_id == ubud["id"]
+    assert candidate.title == "Partial Run Preserved Garden"
+    assert len(completed["failures"]) == 1
+    assert completed["failures"][0]["region_id"] == east_bali["id"]
+    assert completed["failures"][0]["attempts"] == 3
+    assert stored_failures == completed["failures"]
+    assert after[ubud["id"]] == before.get(ubud["id"], 0) + 1
+    assert after[east_bali["id"]] == before.get(east_bali["id"], 0)
+    assert calls["ubud"] == 1
+    assert calls["east-bali"] == 3
+    assert retry_sleep.call_count == 2
+
+
+def test_all_failed_regions_are_returned_without_summary_truncation() -> None:
+    calls: Counter[str] = Counter()
+
+    def always_fails(region, _limit: int, _phase: int) -> list[dict]:
+        calls[region.slug] += 1
+        raise TimeoutError("provider unavailable")
+
+    with TestClient(app) as client:
+        admin = _login(client, "joohan92@naver.com", "admin-test-password")
+        regions = client.get("/api/regions", headers=admin).json()
+        with (
+            patch("app.discovery.fetch_osm_elements", side_effect=always_fails),
+            patch("app.discovery._sleep_before_fetch_retry"),
+        ):
+            queued = client.post(
+                "/api/admin/discovery/run",
+                headers=admin,
+                json={"limit": 200},
+            )
+        completed = _completed_run(client, admin, queued)
+
+    assert completed["run"]["status"] == "failed"
+    assert len(completed["failures"]) == len(regions) > 5
+    assert [failure["region_id"] for failure in completed["failures"]] == [
+        region["id"] for region in regions
+    ]
+    assert all(calls[region["slug"]] == 3 for region in regions)
+    assert all(region["name_ko"] in completed["run"]["summary"] for region in regions)
+
+
+def test_failure_detail_serialization_round_trip_and_corrupt_payload_safety() -> None:
+    failure = DiscoveryRegionFailure(
+        region_id=18,
+        region_name="누사 페니다",
+        attempts=3,
+        errors=(
+            DiscoveryFetchError(
+                endpoint="https://overpass-api.de/api/interpreter",
+                error_type="HTTPError",
+                status_code=504,
+                message="Gateway Timeout",
+                segment="tile-2-2/2x2:phase-3",
+                attempt=3,
+            ),
+        ),
+    )
+
+    encoded = _serialize_failure_details([failure])
+    decoded = _deserialize_failure_details(encoded)
+
+    assert [item.model_dump() for item in decoded] == [failure.as_dict()]
+    assert "누사 페니다" in encoded
+    assert _deserialize_failure_details("not-json") == []
+    assert _deserialize_failure_details('{"failures": []}') == []
+    assert _deserialize_failure_details('[{"region_id": "invalid"}]') == []
 
 
 def test_discovery_excludes_explicitly_closed_osm_candidate() -> None:
@@ -845,6 +1308,7 @@ def test_workflow_retry_requeues_the_same_failed_run() -> None:
             assert run is not None and job is not None
             run.status = "failed"
             run.summary = "provider failed"
+            run.started_at = datetime.now(timezone.utc) - timedelta(minutes=31)
             run.finished_at = datetime.now(timezone.utc)
             job.active_slot = None
             db.commit()
@@ -854,14 +1318,22 @@ def test_workflow_retry_requeues_the_same_failed_run() -> None:
             assert retried.run.id == run.id
             assert retried.run.status == "queued"
             assert retried.run.finished_at is None
+            renewed_at = retried.run.started_at
+            if renewed_at.tzinfo is None:
+                renewed_at = renewed_at.replace(tzinfo=timezone.utc)
+            assert renewed_at > datetime.now(timezone.utc) - timedelta(minutes=1)
             refreshed_job = db.get(DiscoveryJob, run.id)
             assert refreshed_job is not None
             assert refreshed_job.active_slot == "place_discovery"
 
-            run = db.get(BatchRun, run.id)
-            assert run is not None
-            run.status = "failed"
-            run.finished_at = datetime.now(timezone.utc)
+            claimed_run, _, claimed = _claim_discovery_run(db, run.id)
+            assert claimed is True
+            assert claimed_run.status == "running"
+
+            claimed_run.status = "failed"
+            claimed_run.finished_at = datetime.now(timezone.utc)
+            refreshed_job = db.get(DiscoveryJob, run.id)
+            assert refreshed_job is not None
             refreshed_job.active_slot = None
             db.commit()
 

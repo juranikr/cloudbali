@@ -511,6 +511,56 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 3px s
 .admin__batch article > div { display: grid; justify-items: end; gap: 4px; }
 .admin__batch article b { font-size: .55rem; text-transform: uppercase; }
 .admin__batch article em { color: var(--muted); font-size: .52rem; font-style: normal; }
+.admin__status-badge { display: inline-flex; width: max-content; padding: 5px 8px; border-radius: 999px; align-items: center; background: #e7e8e4; color: #51605b; font-size: .52rem; font-weight: 800; line-height: 1; white-space: nowrap; }
+.admin__status-badge--queued, .admin__status-badge--running { background: #e3edf3; color: #315f78; }
+.admin__status-badge--success { background: #deefe6; color: #246447; }
+.admin__status-badge--partial { background: #faedcf; color: #80530b; }
+.admin__status-badge--failed { background: #f8dfd8; color: #913d2e; }
+.admin__discovery-failures { min-width: 0; margin: 18px 0; padding: 17px; border: 1px solid #e3b65f; border-radius: 13px; overflow: hidden; background: #fff9ea; }
+.admin__discovery-failures > header { display: flex; justify-content: space-between; align-items: flex-start; gap: 14px; }
+.admin__discovery-failures > header small, .admin__discovery-failures > header h3 { display: block; }
+.admin__discovery-failures > header small { color: #94651a; font-size: .49rem; font-weight: 850; letter-spacing: .1em; }
+.admin__discovery-failures > header h3 { margin: 5px 0 0; color: #4f3a18; font-size: .72rem; }
+.admin__failure-regions, .admin__failure-errors { margin: 0; padding: 0; list-style: none; }
+.admin__failure-regions { display: grid; margin-top: 13px; gap: 9px; }
+.admin__failure-regions > li { min-width: 0; padding: 12px; border: 1px solid rgba(151,103,25,.22); border-radius: 10px; background: rgba(255,255,255,.7); }
+.admin__failure-regions > li > header { display: flex; justify-content: space-between; gap: 10px; align-items: baseline; }
+.admin__failure-regions > li > header strong { color: #523d1c; font-size: .64rem; }
+.admin__failure-regions > li > header span { color: #836c46; font-size: .51rem; white-space: nowrap; }
+.admin__failure-errors { display: grid; margin-top: 9px; gap: 7px; }
+.admin__failure-errors > li { display: grid; grid-template-columns: minmax(150px, .55fr) minmax(210px, 1.45fr) auto; padding: 9px 10px; border-radius: 8px; gap: 10px; align-items: center; background: #f7f1e3; }
+.admin__failure-errors > li > div { min-width: 0; }
+.admin__failure-errors > li > div strong, .admin__failure-errors > li > div span { display: block; }
+.admin__failure-errors > li > div strong { overflow: hidden; color: #6f4610; font: 700 .55rem/1.35 ui-monospace, SFMono-Regular, Consolas, monospace; text-overflow: ellipsis; white-space: nowrap; }
+.admin__failure-errors > li > div span { width: max-content; margin-top: 4px; padding: 3px 5px; border-radius: 4px; background: #f2d7bd; color: #873e21; font-size: .49rem; font-weight: 800; }
+.admin__failure-errors > li > p { margin: 0; color: #534a3e; font-size: .55rem; line-height: 1.55; overflow-wrap: anywhere; }
+.admin__failure-errors > li > small { color: #836c46; font-size: .49rem; text-align: right; white-space: nowrap; }
+.admin__failure-fallback { margin: 12px 0 0; padding: 11px 12px; border-radius: 8px; background: #f7f1e3; color: #604e30; font-size: .58rem; line-height: 1.6; overflow-wrap: anywhere; }
+.admin__discovery-history { min-width: 0; margin: 20px 0 24px; padding: 16px; border: 1px solid var(--line); border-radius: 12px; overflow: hidden; background: #f7f5ee; }
+.admin__discovery-history > header { display: flex; padding-bottom: 11px; border-bottom: 1px solid var(--line); justify-content: space-between; align-items: flex-end; gap: 12px; }
+.admin__discovery-history > header small, .admin__discovery-history > header h3 { display: block; }
+.admin__discovery-history > header small { color: var(--coral); font-size: .47rem; font-weight: 850; letter-spacing: .1em; }
+.admin__discovery-history > header h3 { margin: 4px 0 0; font-size: .7rem; }
+.admin__discovery-history > header > span { color: var(--muted); font-size: .54rem; }
+.admin__discovery-history > ol { display: grid; max-height: 360px; margin: 0; padding: 0; overflow-x: hidden; overflow-y: auto; list-style: none; }
+.admin__discovery-history > ol > li { display: grid; min-width: 0; grid-template-columns: auto minmax(0, 1fr) auto; padding: 12px 4px; border-bottom: 1px solid var(--line); gap: 11px; align-items: center; }
+.admin__discovery-history > ol > li:last-child { border-bottom: 0; }
+.admin__discovery-history > ol > li.selected { margin-inline: -7px; padding-inline: 11px; border-radius: 8px; background: #fffaf0; box-shadow: inset 3px 0 0 #d9992f; }
+.admin__discovery-history li > i { width: 10px; height: 10px; border-radius: 50%; background: #88958f; }
+.admin__discovery-history li > i.batch-status--success { background: #3c9b6f; }
+.admin__discovery-history li > i.batch-status--partial { background: #d9992f; }
+.admin__discovery-history li > i.batch-status--failed { background: #c84d3d; }
+.admin__discovery-history li > div { min-width: 0; }
+.admin__discovery-history li > div strong, .admin__discovery-history li > div time { display: inline; font-size: .56rem; }
+.admin__discovery-history li > div time { margin-left: 7px; color: var(--muted); }
+.admin__discovery-history li > div p { margin: 5px 0 0; color: #58655f; font-size: .54rem; line-height: 1.5; overflow-wrap: anywhere; }
+.admin__discovery-history li > span { display: grid; min-width: 0; justify-items: end; gap: 5px; }
+.admin__discovery-history li > span small { color: var(--muted); font-size: .49rem; white-space: nowrap; }
+.admin__discovery-history li > span button { padding: 6px 8px; border: 1px solid #d8b064; border-radius: 7px; background: white; color: #74501a; font-size: .5rem; font-weight: 800; cursor: pointer; }
+.admin__discovery-history li > span button[aria-pressed="true"] { background: #855b16; color: white; }
+.admin__discovery-history li > span button:disabled { opacity: .58; cursor: default; }
+.admin__discovery-history li > span button:focus-visible, .admin__discovery-history a:focus-visible { outline: 3px solid rgba(36,86,72,.3); outline-offset: 2px; }
+.admin__history-empty { margin: 0; padding: 24px 10px 8px; color: var(--muted); font-size: .56rem; text-align: center; }
 .admin__research { margin: 0 0 26px; padding: 20px; border: 1px solid rgba(36,86,72,.28); border-radius: 14px; background: #edf4f0; }
 .admin__research > header { display: flex; padding-bottom: 15px; justify-content: space-between; align-items: flex-end; gap: 15px; }
 .admin__research > header small, .admin__research > header strong, .admin__research > header span { display: block; }
@@ -599,6 +649,15 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 3px s
   .admin__research > header > div:last-child { flex-wrap: wrap; }
   .admin__proposals article { grid-template-columns: auto minmax(0, 1fr); }
   .admin__proposals article > div { grid-column: 1 / -1; justify-content: flex-end; }
+  .admin__discovery-failures > header { align-items: flex-start; flex-direction: column; }
+  .admin__failure-regions > li > header { align-items: flex-start; flex-direction: column; gap: 3px; }
+  .admin__failure-errors > li { grid-template-columns: minmax(0, 1fr); gap: 6px; align-items: start; }
+  .admin__failure-errors > li > small { text-align: left; white-space: normal; }
+  .admin__discovery-history > ol > li { grid-template-columns: auto minmax(0, 1fr); align-items: start; }
+  .admin__discovery-history li > div time { display: block; margin: 3px 0 0; }
+  .admin__discovery-history li > span { grid-column: 2; grid-template-columns: auto minmax(0, 1fr); width: 100%; justify-items: start; align-items: center; }
+  .admin__discovery-history li > span small { white-space: normal; }
+  .admin__discovery-history li > span button { grid-column: 1 / -1; max-width: 100%; white-space: normal; }
 }
 
 @media (max-width: 520px) {
@@ -625,4 +684,5 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 3px s
   .admin__batch > header > div:last-child { justify-content: flex-start !important; }
   .admin__batch article { grid-template-columns: auto minmax(0, 1fr); }
   .admin__batch article > div { grid-column: 1 / -1; justify-items: start; padding-left: 22px; }
+  .admin__discovery-failures, .admin__discovery-history { padding: 13px 11px; }
 }

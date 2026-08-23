@@ -241,6 +241,10 @@ class DiscoveryJob(Base):
     requested_limit: Mapped[int] = mapped_column(Integer)
     duplicate_count: Mapped[int] = mapped_column(Integer, default=0)
     invalid_count: Mapped[int] = mapped_column(Integer, default=0)
+    # JSON-encoded per-region provider failures.  Text keeps this additive
+    # migration portable across the project's SQLite tests and PostgreSQL
+    # deployment, while the API exposes a typed structure.
+    failure_details: Mapped[str] = mapped_column(Text, default="[]")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()

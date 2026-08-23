@@ -65,6 +65,28 @@ def _send_failure(
     )
 
 
+def _result_payload(result: Any) -> dict[str, Any]:
+    """Build the callback and structured-log contract for one finished run.
+
+    ``failures`` was added after the durable worker shipped. Keeping the
+    attribute optional lets an older API contract finish safely during a
+    rolling deployment; the partial-status metric filter does not depend on
+    this counter to emit an alert.
+    """
+
+    failures = getattr(result, "failures", None)
+    failed_region_count = len(failures) if failures is not None else 0
+    return {
+        "run_id": result.run.id,
+        "status": result.run.status,
+        "created": result.created_count,
+        "duplicates": result.duplicate_count,
+        "invalid": result.invalid_count,
+        "failed_region_count": failed_region_count,
+        "summary": result.run.summary,
+    }
+
+
 def main() -> None:
     task_token = os.getenv("SFN_TASK_TOKEN", "").strip()
     try:
@@ -126,14 +148,7 @@ def main() -> None:
         )
         raise
 
-    payload = {
-        "run_id": result.run.id,
-        "status": result.run.status,
-        "created": result.created_count,
-        "duplicates": result.duplicate_count,
-        "invalid": result.invalid_count,
-        "summary": result.run.summary,
-    }
+    payload = _result_payload(result)
     print(json.dumps(payload, ensure_ascii=False))
     if result.run.status == "failed":
         _send_failure(

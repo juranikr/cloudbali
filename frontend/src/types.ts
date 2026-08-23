@@ -215,6 +215,23 @@ export type DiscoveryRunResult = {
   created_count: number;
   duplicate_count: number;
   invalid_count: number;
+  failures?: DiscoveryRegionFailure[];
+};
+
+export type DiscoveryRegionFailure = {
+  region_id: number;
+  region_name: string;
+  attempts: number;
+  errors: DiscoveryEndpointError[];
+};
+
+export type DiscoveryEndpointError = {
+  endpoint: string | null;
+  error_type: string;
+  status_code?: number | null;
+  message: string;
+  segment?: string;
+  attempt: number;
 };
 
 export type PlaceChangeEvent = {

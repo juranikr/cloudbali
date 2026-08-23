@@ -3,13 +3,15 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import random
 import re
+import time
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlencode
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from sqlalchemy.exc import IntegrityError
@@ -32,6 +34,7 @@ from app.schemas import (
     BatchRunOut,
     DiscoveryCandidateOut,
     DiscoveryDecisionOut,
+    DiscoveryRegionFailureOut,
     DiscoveryRunOut,
 )
 
@@ -45,6 +48,23 @@ MAX_CANDIDATES_PER_RUN = 200
 MAX_OSM_ELEMENTS_PER_REGION = 1000
 MAX_BBOX_SPAN = 1.5
 QUERY_PHASE_COUNT = 4
+SPLIT_REGION_SLUGS = frozenset({"east-bali", "nusa-penida"})
+SPLIT_REGION_GRID_SIZE = 2
+MAX_REGION_FETCH_ATTEMPTS = 3
+RETRY_BACKOFF_SECONDS = 2.0
+MAX_RETRY_BACKOFF_SECONDS = 8.0
+TRANSIENT_HTTP_STATUS_CODES = frozenset({408, 425, 429})
+TRANSIENT_PROVIDER_ERROR_TYPES = frozenset({
+    "BrokenPipeError",
+    "ConnectionAbortedError",
+    "ConnectionError",
+    "ConnectionRefusedError",
+    "ConnectionResetError",
+    "IncompleteRead",
+    "RemoteDisconnected",
+    "TimeoutError",
+    "URLError",
+})
 STALE_RUN_AFTER = timedelta(minutes=30)
 ACTIVE_DISCOVERY_SLOT = "place_discovery"
 ACTIVE_RUN_STATUSES = frozenset({"queued", "running"})
@@ -63,6 +83,98 @@ class DiscoveryBusyError(RuntimeError):
 
 class CandidateInactiveError(ValueError):
     """Raised after an authoritative source blocks and records an approval."""
+
+
+@dataclass(frozen=True)
+class OverpassSegment:
+    """One bounded provider query within a discovery region."""
+
+    name: str
+    south: float
+    west: float
+    north: float
+    east: float
+
+
+@dataclass(frozen=True)
+class DiscoveryRegionSnapshot:
+    """Thread-safe scalar region data copied before the ORM session commits."""
+
+    id: int
+    slug: str
+    name_ko: str
+    south: float
+    west: float
+    north: float
+    east: float
+
+
+@dataclass(frozen=True)
+class DiscoveryFetchSpec:
+    """Provider inputs plus the scan-state version that selected them."""
+
+    region: DiscoveryRegionSnapshot
+    limit: int
+    query_phase: int
+    scan_state_id: int
+    scan_query_phase: int
+    scan_fetch_limit: int
+    scan_count: int
+
+
+@dataclass(frozen=True)
+class DiscoveryFetchError:
+    endpoint: str | None
+    error_type: str
+    status_code: int | None
+    message: str
+    segment: str
+    attempt: int = 0
+
+    def at_attempt(self, attempt: int) -> DiscoveryFetchError:
+        return DiscoveryFetchError(
+            endpoint=self.endpoint,
+            error_type=self.error_type,
+            status_code=self.status_code,
+            message=self.message,
+            segment=self.segment,
+            attempt=attempt,
+        )
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "endpoint": self.endpoint,
+            "error_type": self.error_type,
+            "status_code": self.status_code,
+            "message": self.message,
+            "segment": self.segment,
+            "attempt": self.attempt,
+        }
+
+
+@dataclass(frozen=True)
+class DiscoveryRegionFailure:
+    region_id: int
+    region_name: str
+    attempts: int
+    errors: tuple[DiscoveryFetchError, ...]
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "region_id": self.region_id,
+            "region_name": self.region_name,
+            "attempts": self.attempts,
+            "errors": [error.as_dict() for error in self.errors],
+        }
+
+
+class OverpassRequestError(RuntimeError):
+    """A bounded Overpass attempt failed, with no response bodies retained."""
+
+    def __init__(self, errors: list[DiscoveryFetchError]):
+        self.errors = tuple(errors)
+        error_types = ", ".join(error.error_type for error in errors) or "unknown"
+        super().__init__(f"Overpass request failed ({error_types})")
 
 
 @dataclass(frozen=True)
@@ -91,7 +203,7 @@ def _cli_limit(value: str) -> int:
     return parsed
 
 
-def _valid_bbox(region: Region) -> bool:
+def _valid_bbox(region: Region | DiscoveryRegionSnapshot) -> bool:
     return (
         -90 <= region.south < region.north <= 90
         and -180 <= region.west < region.east <= 180
@@ -100,10 +212,80 @@ def _valid_bbox(region: Region) -> bool:
     )
 
 
-def _overpass_query(region: Region, limit: int, query_phase: int = 0) -> str:
+def _region_snapshot(region: Region) -> DiscoveryRegionSnapshot:
+    return DiscoveryRegionSnapshot(
+        id=region.id,
+        slug=region.slug,
+        name_ko=region.name_ko,
+        south=region.south,
+        west=region.west,
+        north=region.north,
+        east=region.east,
+    )
+
+
+def _overpass_segments(
+    region: Region | DiscoveryRegionSnapshot,
+    query_phase: int = 0,
+) -> tuple[OverpassSegment, ...]:
+    """Split only known heavy regions into a bounded 2x2 grid.
+
+    The category phase remains separate, so no tile query expands back into an
+    all-category Overpass scan. Other regions retain their single-query path.
+    """
+
     if not _valid_bbox(region):
         raise ValueError(f"안전 범위를 벗어난 권역 bbox: {region.slug}")
-    bbox = f"{region.south:.6f},{region.west:.6f},{region.north:.6f},{region.east:.6f}"
+    phase = int(query_phase) % QUERY_PHASE_COUNT
+    if region.slug not in SPLIT_REGION_SLUGS:
+        return (
+            OverpassSegment(
+                name=f"full:phase-{phase}",
+                south=region.south,
+                west=region.west,
+                north=region.north,
+                east=region.east,
+            ),
+        )
+
+    lat_step = (region.north - region.south) / SPLIT_REGION_GRID_SIZE
+    lng_step = (region.east - region.west) / SPLIT_REGION_GRID_SIZE
+    segments: list[OverpassSegment] = []
+    for row in range(SPLIT_REGION_GRID_SIZE):
+        for column in range(SPLIT_REGION_GRID_SIZE):
+            south = region.south + row * lat_step
+            north = region.north if row == SPLIT_REGION_GRID_SIZE - 1 else south + lat_step
+            west = region.west + column * lng_step
+            east = region.east if column == SPLIT_REGION_GRID_SIZE - 1 else west + lng_step
+            segments.append(
+                OverpassSegment(
+                    name=(
+                        f"tile-{row + 1}-{column + 1}/"
+                        f"{SPLIT_REGION_GRID_SIZE}x{SPLIT_REGION_GRID_SIZE}:phase-{phase}"
+                    ),
+                    south=south,
+                    west=west,
+                    north=north,
+                    east=east,
+                )
+            )
+    return tuple(segments)
+
+
+def _overpass_query(
+    region: Region | DiscoveryRegionSnapshot,
+    limit: int,
+    query_phase: int = 0,
+    *,
+    segment: OverpassSegment | None = None,
+) -> str:
+    if not _valid_bbox(region):
+        raise ValueError(f"안전 범위를 벗어난 권역 bbox: {region.slug}")
+    active_segment = segment or _overpass_segments(region, query_phase)[0]
+    bbox = (
+        f"{active_segment.south:.6f},{active_segment.west:.6f},"
+        f"{active_segment.north:.6f},{active_segment.east:.6f}"
+    )
     safe_limit = max(1, min(int(limit), MAX_OSM_ELEMENTS_PER_REGION))
     phase = int(query_phase) % QUERY_PHASE_COUNT
     selectors = (
@@ -123,12 +305,43 @@ def _overpass_query(region: Region, limit: int, query_phase: int = 0) -> str:
 out center {safe_limit};'''
 
 
-def fetch_osm_elements(region: Region, limit: int, query_phase: int = 0) -> list[dict]:
-    """Fetch a bounded OSM result set. No candidate is published by this function."""
+def _safe_provider_error_message(exc: Exception) -> str:
+    """Return a short diagnostic without storing provider response bodies."""
 
-    query = _overpass_query(region, limit, query_phase)
+    if isinstance(exc, HTTPError):
+        raw_message = exc.reason or f"HTTP {exc.code}"
+    else:
+        raw_message = getattr(exc, "reason", None) or str(exc) or type(exc).__name__
+    message = " ".join(str(raw_message).split())
+    return (message or "provider request failed")[:240]
+
+
+def _provider_error(
+    *,
+    endpoint: str,
+    segment: OverpassSegment,
+    exc: Exception,
+) -> DiscoveryFetchError:
+    raw_status = getattr(exc, "code", None)
+    status_code = raw_status if isinstance(raw_status, int) else None
+    return DiscoveryFetchError(
+        endpoint=endpoint,
+        error_type=type(exc).__name__[:80],
+        status_code=status_code,
+        message=_safe_provider_error_message(exc),
+        segment=segment.name,
+    )
+
+
+def _fetch_osm_segment(
+    region: Region | DiscoveryRegionSnapshot,
+    limit: int,
+    query_phase: int,
+    segment: OverpassSegment,
+) -> list[dict]:
+    query = _overpass_query(region, limit, query_phase, segment=segment)
     payload = urlencode({"data": query}).encode("utf-8")
-    errors: list[str] = []
+    errors: list[DiscoveryFetchError] = []
     for endpoint in OVERPASS_ENDPOINTS:
         request = Request(
             endpoint,
@@ -147,8 +360,121 @@ def fetch_osm_elements(region: Region, limit: int, query_phase: int = 0) -> list
                 raise ValueError("Overpass elements 응답이 배열이 아닙니다")
             return elements[: max(1, min(int(limit), MAX_OSM_ELEMENTS_PER_REGION))]
         except Exception as exc:
-            errors.append(type(exc).__name__)
-    raise RuntimeError("Overpass 요청 실패: " + ", ".join(errors))
+            errors.append(_provider_error(endpoint=endpoint, segment=segment, exc=exc))
+    raise OverpassRequestError(errors)
+
+
+def fetch_osm_elements(
+    region: Region | DiscoveryRegionSnapshot,
+    limit: int,
+    query_phase: int = 0,
+) -> list[dict]:
+    """Fetch a bounded, de-duplicated OSM result set.
+
+    Heavy regions divide the same per-region limit across four spatial tiles;
+    the function never multiplies the requested result cap by the tile count.
+    """
+
+    safe_limit = max(1, min(int(limit), MAX_OSM_ELEMENTS_PER_REGION))
+    segments = _overpass_segments(region, query_phase)
+    base_limit, extra = divmod(safe_limit, len(segments))
+    seen: set[tuple[str, object]] = set()
+    combined: list[dict] = []
+    for index, segment in enumerate(segments):
+        segment_limit = base_limit + (1 if index < extra else 0)
+        if segment_limit <= 0:
+            continue
+        elements = _fetch_osm_segment(region, segment_limit, query_phase, segment)
+        for element in elements:
+            key = (str(element.get("type", "")), element.get("id"))
+            if key in seen:
+                continue
+            seen.add(key)
+            combined.append(element)
+    return combined[:safe_limit]
+
+
+def _fetch_errors_for_attempt(
+    exc: Exception,
+    *,
+    query_phase: int,
+    attempt: int,
+) -> list[DiscoveryFetchError]:
+    if isinstance(exc, OverpassRequestError):
+        return [error.at_attempt(attempt) for error in exc.errors]
+    return [
+        DiscoveryFetchError(
+            endpoint=None,
+            error_type=type(exc).__name__[:80],
+            status_code=None,
+            message=_safe_provider_error_message(exc),
+            segment=f"region:phase-{int(query_phase) % QUERY_PHASE_COUNT}",
+            attempt=attempt,
+        )
+    ]
+
+
+def _sleep_before_fetch_retry(failed_attempt: int) -> None:
+    """Apply a short, bounded exponential delay with positive jitter."""
+
+    base_delay = min(
+        MAX_RETRY_BACKOFF_SECONDS,
+        RETRY_BACKOFF_SECONDS * (2 ** max(0, failed_attempt - 1)),
+    )
+    upper_bound = min(MAX_RETRY_BACKOFF_SECONDS, base_delay * 1.25)
+    time.sleep(random.uniform(base_delay, upper_bound))
+
+
+def _provider_error_is_transient(error: DiscoveryFetchError) -> bool:
+    if error.status_code is not None:
+        return (
+            error.status_code in TRANSIENT_HTTP_STATUS_CODES
+            or 500 <= error.status_code <= 599
+        )
+    return error.error_type in TRANSIENT_PROVIDER_ERROR_TYPES
+
+
+def _fetch_exception_is_transient(exc: Exception) -> bool:
+    if isinstance(exc, OverpassRequestError):
+        return any(_provider_error_is_transient(error) for error in exc.errors)
+    if isinstance(exc, HTTPError):
+        return exc.code in TRANSIENT_HTTP_STATUS_CODES or 500 <= exc.code <= 599
+    return isinstance(exc, (TimeoutError, ConnectionError, URLError))
+
+
+def _fetch_region_with_retry(
+    region: Region | DiscoveryRegionSnapshot,
+    limit: int,
+    query_phase: int,
+) -> tuple[list[dict] | None, DiscoveryRegionFailure | None]:
+    """Fetch one region at most three times without touching other regions.
+
+    A split region is the retry unit: if one tile fails, the bounded tile set is
+    fetched again on the next attempt. This deliberately avoids mixing a
+    partial provider snapshot into the candidate transaction.
+    """
+
+    errors: list[DiscoveryFetchError] = []
+    for attempt in range(1, MAX_REGION_FETCH_ATTEMPTS + 1):
+        try:
+            return fetch_osm_elements(region, limit, query_phase), None
+        except Exception as exc:
+            errors.extend(
+                _fetch_errors_for_attempt(
+                    exc,
+                    query_phase=query_phase,
+                    attempt=attempt,
+                )
+            )
+            if not _fetch_exception_is_transient(exc) or attempt >= MAX_REGION_FETCH_ATTEMPTS:
+                return None, DiscoveryRegionFailure(
+                    region_id=region.id,
+                    region_name=region.name_ko,
+                    attempts=attempt,
+                    errors=tuple(errors),
+                )
+            _sleep_before_fetch_retry(attempt)
+    raise AssertionError("bounded discovery retry loop did not return")
 
 
 def _category(tags: dict[str, str]) -> tuple[str, str] | None:
@@ -758,12 +1084,39 @@ def _discovery_regions(db: Session, region_id: int | None) -> list[Region]:
     return regions
 
 
+def _serialize_failure_details(failures: list[DiscoveryRegionFailure]) -> str:
+    return json.dumps(
+        [failure.as_dict() for failure in failures],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
+def _deserialize_failure_details(value: str | None) -> list[DiscoveryRegionFailureOut]:
+    """Read only schema-valid failure rows so corrupt legacy data cannot break polling."""
+
+    try:
+        raw_items = json.loads(value or "[]")
+    except (TypeError, json.JSONDecodeError):
+        return []
+    if not isinstance(raw_items, list):
+        return []
+    failures: list[DiscoveryRegionFailureOut] = []
+    for raw_item in raw_items:
+        try:
+            failures.append(DiscoveryRegionFailureOut.model_validate(raw_item))
+        except (TypeError, ValueError):
+            continue
+    return failures
+
+
 def _discovery_run_out(run: BatchRun, job: DiscoveryJob) -> DiscoveryRunOut:
     return DiscoveryRunOut(
         run=BatchRunOut.model_validate(run),
         created_count=run.updated_count,
         duplicate_count=job.duplicate_count,
         invalid_count=job.invalid_count,
+        failures=_deserialize_failure_details(job.failure_details),
     )
 
 
@@ -1034,46 +1387,139 @@ def _execute_discovery_run(db: Session, run_id: int) -> DiscoveryRunOut:
 
     try:
         regions = _discovery_regions(db, job.region_id)
+        region_ids = [region.id for region in regions]
         limit = max(1, min(int(job.requested_limit), MAX_CANDIDATES_PER_RUN))
         creation_allocations = _allocate_limits(regions, limit)
         fetch_regions = [region for region in regions if region.id in creation_allocations]
         scan_states = {region.id: _locked_scan_state(db, region.id) for region in fetch_regions}
-        fetch_specs: dict[int, tuple[int, int]] = {}
+        fetch_specs: dict[int, DiscoveryFetchSpec] = {}
         for region in fetch_regions:
             state = scan_states[region.id]
             minimum = max(20, creation_allocations[region.id] * 3)
-            fetch_specs[region.id] = (
-                min(MAX_OSM_ELEMENTS_PER_REGION, max(minimum, state.fetch_limit)),
-                state.query_phase % QUERY_PHASE_COUNT,
+            fetch_specs[region.id] = DiscoveryFetchSpec(
+                region=_region_snapshot(region),
+                limit=min(
+                    MAX_OSM_ELEMENTS_PER_REGION,
+                    max(minimum, state.fetch_limit),
+                ),
+                query_phase=state.query_phase % QUERY_PHASE_COUNT,
+                scan_state_id=state.id,
+                scan_query_phase=state.query_phase,
+                scan_fetch_limit=state.fetch_limit,
+                scan_count=state.scan_count,
             )
 
+        # Provider calls can take minutes under overload. Commit the short scan
+        # snapshot transaction before starting any network request or retry
+        # backoff, releasing every DiscoveryScanState row lock. ORM Region rows
+        # expire here, so workers receive only immutable scalar snapshots.
+        db.commit()
+        db.expire_all()
+        if db.in_transaction():  # pragma: no cover - defensive SQLAlchemy invariant
+            raise RuntimeError("provider fetch started with an open database transaction")
+
         raw_by_region: dict[int, list[dict]] = {}
-        failures: list[str] = []
-        # Locking scan-state rows serializes overlapping runs for the same
-        # regions; two workers only parallelize independent Overpass requests.
-        with ThreadPoolExecutor(max_workers=min(2, len(fetch_regions))) as executor:
+        failures_by_region: dict[int, DiscoveryRegionFailure] = {}
+        with ThreadPoolExecutor(max_workers=min(2, len(fetch_specs))) as executor:
             futures = {
-                executor.submit(fetch_osm_elements, region, *fetch_specs[region.id]): region
-                for region in fetch_regions
+                executor.submit(
+                    _fetch_region_with_retry,
+                    spec.region,
+                    spec.limit,
+                    spec.query_phase,
+                ): spec
+                for spec in fetch_specs.values()
             }
             for future in as_completed(futures):
-                region = futures[future]
+                spec = futures[future]
                 try:
-                    fetch_limit, _ = fetch_specs[region.id]
-                    raw = future.result()[:fetch_limit]
-                    raw_by_region[region.id] = raw
-                    _advance_scan_state(
-                        scan_states[region.id],
-                        requested_limit=fetch_limit,
-                        result_count=len(raw),
-                    )
+                    raw, failure = future.result()
+                    if failure is not None:
+                        failures_by_region[spec.region.id] = failure
+                        continue
+                    raw_by_region[spec.region.id] = (raw or [])[:spec.limit]
                 except Exception as exc:
-                    failures.append(f"{region.name_ko}: {type(exc).__name__}")
+                    failures_by_region[spec.region.id] = DiscoveryRegionFailure(
+                        region_id=spec.region.id,
+                        region_name=spec.region.name_ko,
+                        attempts=1,
+                        errors=tuple(
+                            _fetch_errors_for_attempt(
+                                exc,
+                                query_phase=spec.query_phase,
+                                attempt=1,
+                            )
+                        ),
+                    )
 
-        # Provider I/O is complete. Lock existing candidate rows before active
-        # Places in the same order used by merge, then build duplicate links
-        # from a current snapshot. A merge that wins first is already visible;
-        # a merge that waits will re-scan and move these new candidate links.
+        # Futures complete out of order; persist and display failures in the
+        # same stable region order used by the discovery run.
+        failures = [
+            failures_by_region[region_id]
+            for region_id in fetch_specs
+            if region_id in failures_by_region
+        ]
+
+        # Re-enter the database only after all provider I/O and backoff ends.
+        # Match the stale reaper's job -> run order and validate the lease before
+        # touching scan state or candidate data. Holding these locks through the
+        # final commit makes scan advancement and candidate writes atomic, while
+        # a stale late worker returns without mutating either.
+        with db.no_autoflush:
+            job = (
+                db.query(DiscoveryJob)
+                .filter(DiscoveryJob.batch_run_id == run_id)
+                .with_for_update()
+                .populate_existing()
+                .one()
+            )
+            run = (
+                db.query(BatchRun)
+                .filter(BatchRun.id == run_id)
+                .with_for_update()
+                .populate_existing()
+                .one()
+            )
+        if job.active_slot != ACTIVE_DISCOVERY_SLOT or run.status != "running":
+            db.rollback()
+            db.expire_all()
+            lost_job = db.get(DiscoveryJob, run_id)
+            lost_run = db.get(BatchRun, run_id)
+            if lost_job is None or lost_run is None:
+                raise LookupError("발굴 실행 이력을 찾을 수 없습니다")
+            return _discovery_run_out(lost_run, lost_job)
+
+        regions = _discovery_regions(db, job.region_id)
+        if [region.id for region in regions] != region_ids:
+            raise RuntimeError("발굴 중 권역 구성이 변경되어 결과를 저장하지 않았습니다")
+
+        successful_scan_states: dict[int, DiscoveryScanState] = {}
+        for region_id, spec in fetch_specs.items():
+            if region_id not in raw_by_region:
+                continue
+            state = _locked_scan_state(db, region_id)
+            if (
+                state.id != spec.scan_state_id
+                or state.query_phase != spec.scan_query_phase
+                or state.fetch_limit != spec.scan_fetch_limit
+                or state.scan_count != spec.scan_count
+            ):
+                raise RuntimeError(
+                    f"발굴 중 스캔 상태가 변경되어 결과를 저장하지 않았습니다: {spec.region.slug}"
+                )
+            successful_scan_states[region_id] = state
+
+        for region_id, state in successful_scan_states.items():
+            spec = fetch_specs[region_id]
+            _advance_scan_state(
+                state,
+                requested_limit=spec.limit,
+                result_count=len(raw_by_region[region_id]),
+            )
+
+        # Lock existing candidate rows before active Places in the same order
+        # used by merge, then build duplicate links from a current snapshot. A
+        # merge that wins first is visible; a waiting merge will re-scan links.
         existing_candidate_rows = db.query(DiscoveryCandidate).filter(
             DiscoveryCandidate.source == SOURCE
         ).order_by(DiscoveryCandidate.id).populate_existing().with_for_update().all()
@@ -1199,39 +1645,25 @@ def _execute_discovery_run(db: Session, run_id: int) -> DiscoveryRunOut:
             f"OSM {scanned}건 조회, 후보 {created}건 저장, 중복 {duplicates}건, 제외 {invalid}건"
         )
         if failures:
-            final_summary += "; 실패 " + ", ".join(failures[:5])
-
-        # Lock in the same job -> run order as the stale reaper. If that reaper
-        # already revoked this worker's lease, roll back all still-uncommitted
-        # candidates instead of letting a late worker resurrect a failed run.
-        with db.no_autoflush:
-            job = (
-                db.query(DiscoveryJob)
-                .filter(DiscoveryJob.batch_run_id == run_id)
-                .with_for_update()
-                .populate_existing()
-                .one()
-            )
-            run = (
-                db.query(BatchRun)
-                .filter(BatchRun.id == run_id)
-                .with_for_update()
-                .populate_existing()
-                .one()
-            )
-        if job.active_slot != ACTIVE_DISCOVERY_SLOT or run.status != "running":
-            db.rollback()
-            db.expire_all()
-            lost_job = db.get(DiscoveryJob, run_id)
-            lost_run = db.get(BatchRun, run_id)
-            if lost_job is None or lost_run is None:
-                raise LookupError("발굴 실행 이력을 찾을 수 없습니다")
-            return _discovery_run_out(lost_run, lost_job)
+            failure_labels: list[str] = []
+            for failure in failures:
+                last_error = failure.errors[-1] if failure.errors else None
+                if last_error is None:
+                    reason = "UnknownError"
+                elif last_error.status_code is not None:
+                    reason = f"{last_error.error_type} HTTP {last_error.status_code}"
+                else:
+                    reason = last_error.error_type
+                failure_labels.append(
+                    f"{failure.region_name}: {reason} ({failure.attempts}회 시도)"
+                )
+            final_summary += "; 실패 " + ", ".join(failure_labels)
 
         run.scanned_count = scanned
         run.updated_count = created
         job.duplicate_count = duplicates
         job.invalid_count = invalid
+        job.failure_details = _serialize_failure_details(failures)
         run.status = final_status
         run.summary = final_summary
         run.finished_at = datetime.now(timezone.utc)
@@ -1308,10 +1740,15 @@ def prepare_discovery_retry(db: Session, run_id: int) -> DiscoveryRunOut:
         job.active_slot = ACTIVE_DISCOVERY_SLOT
         job.duplicate_count = 0
         job.invalid_count = 0
+        job.failure_details = "[]"
         run.status = "queued"
         run.scanned_count = 0
         run.updated_count = 0
         run.summary = "내구성 워크플로가 장소 발굴 작업을 재시도합니다"
+        # A workflow retry renews the lease. Keeping the original timestamp
+        # would make a run that timed out after 30 minutes become stale again
+        # before the replacement Fargate task can claim it.
+        run.started_at = datetime.now(timezone.utc)
         run.finished_at = None
         db.commit()
         db.refresh(run)

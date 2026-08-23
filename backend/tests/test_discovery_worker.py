@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
-from app.discovery_worker import _send_failure, _send_success
+from app.discovery_worker import _result_payload, _send_failure, _send_success
 
 
 class FakeCallbackClient:
@@ -38,3 +39,37 @@ def test_worker_reports_bounded_failure_to_step_functions() -> None:
     assert client.failure is not None
     assert len(client.failure["error"]) == 256
     assert len(client.failure["cause"]) == 32_768
+
+
+def test_worker_payload_reports_partial_status_and_failure_count() -> None:
+    result = SimpleNamespace(
+        run=SimpleNamespace(id=19, status="partial", summary="일부 권역 실패"),
+        created_count=14,
+        duplicate_count=1,
+        invalid_count=4,
+        failures=[SimpleNamespace(region_id=2), SimpleNamespace(region_id=7)],
+    )
+
+    assert _result_payload(result) == {
+        "run_id": 19,
+        "status": "partial",
+        "created": 14,
+        "duplicates": 1,
+        "invalid": 4,
+        "failed_region_count": 2,
+        "summary": "일부 권역 실패",
+    }
+
+
+def test_worker_payload_supports_contract_without_failures() -> None:
+    result = SimpleNamespace(
+        run=SimpleNamespace(id=20, status="partial", summary="legacy result"),
+        created_count=3,
+        duplicate_count=0,
+        invalid_count=1,
+    )
+
+    payload = _result_payload(result)
+
+    assert payload["status"] == "partial"
+    assert payload["failed_region_count"] == 0

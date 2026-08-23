@@ -1,4 +1,4 @@
-import { FormEvent, useEffect, useMemo, useState } from "react";
+import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import * as api from "./api";
 import { BRAND_NAME } from "./brand";
 import type { AdminSummary, AdminUser, AgentProposal, AgentRun, AgentRunStep, BatchRun, DiscoveryCandidate, DiscoveryRunResult, Place, PlaceAppeal, PlaceChangeEvent, Region, User } from "./types";
@@ -114,6 +114,128 @@ function candidateInactiveReason(value: string) {
 }
 
 
+function plainAdminText(value: string | null | undefined) {
+  const decodeCodePoint = (digits: string, radix: number, original: string) => {
+    const codePoint = Number.parseInt(digits, radix);
+    if (!Number.isFinite(codePoint) || codePoint < 0 || codePoint > 0x10ffff) return original;
+    try {
+      return String.fromCodePoint(codePoint);
+    } catch {
+      return original;
+    }
+  };
+  return (value || "")
+    .replace(/&#x([0-9a-f]+);/gi, (original, digits: string) => decodeCodePoint(digits, 16, original))
+    .replace(/&#([0-9]+);/g, (original, digits: string) => decodeCodePoint(digits, 10, original))
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&quot;/gi, "\"")
+    .replace(/(?:&apos;|&#39;)/gi, "'")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+
+function batchStatusLabel(status: BatchRun["status"]) {
+  if (status === "queued") return "대기 중";
+  if (status === "running") return "실행 중";
+  if (status === "success") return "성공";
+  if (status === "partial") return "일부 실패";
+  return "실패";
+}
+
+
+function batchTriggerLabel(trigger: BatchRun["trigger"]) {
+  if (trigger === "manual") return "수동";
+  if (trigger === "schedule") return "예약";
+  return "CLI";
+}
+
+
+function batchRunDate(value: string) {
+  // SQLite can return UTC timestamps without an explicit offset; PostgreSQL
+  // already includes one. Treat only the offset-less legacy form as UTC.
+  const normalized = /(?:Z|[+-]\d{2}:\d{2})$/i.test(value) ? value : value + "Z";
+  return new Date(normalized);
+}
+
+
+function discoveryEndpointLabel(value: string) {
+  const endpoint = plainAdminText(value);
+  try {
+    return new URL(endpoint).hostname || endpoint;
+  } catch {
+    return endpoint || "알 수 없는 서버";
+  }
+}
+
+
+function DiscoveryFailurePanel({ result }: { result: DiscoveryRunResult }) {
+  const failures = result.failures || [];
+  const isActive = result.run.status === "queued" || result.run.status === "running";
+  const needsAttention = failures.length > 0 || result.run.status === "partial" || result.run.status === "failed";
+  if (!needsAttention) return null;
+  const headingId = `discovery-failures-${result.run.id}`;
+  return (
+    <section
+      className="admin__discovery-failures"
+      aria-labelledby={headingId}
+      aria-live="polite"
+    >
+      <header>
+        <div>
+          <small>{isActive ? "수집 중 확인된 오류" : "발굴 실행 결과"}</small>
+          <h3 id={headingId}>실행 #{result.run.id} · 실패 권역 {failures.length || "상세 미제공"}</h3>
+        </div>
+        <span className={`admin__status-badge admin__status-badge--${result.run.status}`}>
+          {batchStatusLabel(result.run.status)}
+        </span>
+      </header>
+      {failures.length ? (
+        <ul className="admin__failure-regions">
+          {failures.map((failure) => (
+            <li key={`${failure.region_id}-${failure.region_name}`}>
+              <header>
+                <strong>{plainAdminText(failure.region_name) || `권역 #${failure.region_id}`}</strong>
+                <span>총 {failure.attempts}회 시도</span>
+              </header>
+              {failure.errors.length ? (
+                <ul className="admin__failure-errors">
+                  {failure.errors.map((item, index) => {
+                    const endpoint = plainAdminText(item.endpoint);
+                    const errorType = plainAdminText(item.error_type) || "요청 오류";
+                    const message = plainAdminText(item.message) || errorType;
+                    return (
+                      <li key={`${item.endpoint || "unknown"}-${item.segment || "all"}-${item.attempt}-${index}`}>
+                        <div>
+                          <strong title={endpoint}>{discoveryEndpointLabel(endpoint)}</strong>
+                          <span>{item.status_code ? `HTTP ${item.status_code}` : errorType}</span>
+                        </div>
+                        <p>{message}</p>
+                        <small>
+                          {item.segment ? `구간 ${plainAdminText(item.segment)} · ` : ""}
+                          {item.attempt}차 시도{item.status_code ? ` · ${errorType}` : ""}
+                        </small>
+                      </li>
+                    );
+                  })}
+                </ul>
+              ) : <p className="admin__failure-fallback">서버별 오류 상세가 제공되지 않았습니다.</p>}
+            </li>
+          ))}
+        </ul>
+      ) : (
+        <p className="admin__failure-fallback">
+          {plainAdminText(result.run.summary) || "실패 상세가 없는 이전 실행입니다. 실행 요약을 확인해 주세요."}
+        </p>
+      )}
+    </section>
+  );
+}
+
+
 function appealStatusLabel(value: PlaceAppeal["status"]) {
   if (value === "resolved") return "수용·해결";
   if (value === "dismissed") return "기각";
@@ -224,6 +346,8 @@ export default function AdminPage({
   const [discoveryLimit, setDiscoveryLimit] = useState(20);
   const [activeDiscoveryRunId, setActiveDiscoveryRunId] = useState<number | null>(null);
   const [discoveryRun, setDiscoveryRun] = useState<DiscoveryRunResult | null>(null);
+  const [discoveryRunLoadingId, setDiscoveryRunLoadingId] = useState<number | null>(null);
+  const discoveryDetailRequestId = useRef(0);
   const [agentMode, setAgentMode] = useState<AgentRun["mode"]>("full");
   const [agentRuns, setAgentRuns] = useState<AgentRun[]>([]);
   const [agentSteps, setAgentSteps] = useState<AgentRunStep[]>([]);
@@ -283,6 +407,8 @@ export default function AdminPage({
   useEffect(() => {
     if (activeDiscoveryRunId === null) return;
     const runId = activeDiscoveryRunId;
+    discoveryDetailRequestId.current += 1;
+    setDiscoveryRunLoadingId(null);
     let cancelled = false;
     let timerId: number | undefined;
 
@@ -293,7 +419,7 @@ export default function AdminPage({
         setDiscoveryRun(result);
         setBatchRuns((current) => [result.run, ...current.filter((run) => run.id !== result.run.id)]);
         if (result.run.status === "queued" || result.run.status === "running") {
-          setNotice(result.run.summary || "새 장소 발굴 작업을 실행하고 있습니다…");
+          setNotice(plainAdminText(result.run.summary) || "새 장소 발굴 작업을 실행하고 있습니다…");
           timerId = window.setTimeout(() => void pollDiscoveryRun(), 1500);
           return;
         }
@@ -309,13 +435,13 @@ export default function AdminPage({
         setSummary(nextSummary);
         setActiveDiscoveryRunId(null);
         if (result.run.status === "failed") {
-          setError(result.run.summary || "새 장소 발굴 작업이 실패했습니다");
+          setError(plainAdminText(result.run.summary) || "새 장소 발굴 작업이 실패했습니다");
           setNotice("");
         } else {
-          setNotice(
-            result.run.summary + " · 신규 후보 " + result.created_count
-            + "개, 중복 " + result.duplicate_count + "개, 제외 " + result.invalid_count + "개",
-          );
+          const resultSummary = plainAdminText(result.run.summary);
+          const resultCounts = "신규 후보 " + result.created_count
+            + "개, 중복 " + result.duplicate_count + "개, 제외 " + result.invalid_count + "개";
+          setNotice([resultSummary, resultCounts].filter(Boolean).join(" · "));
         }
       } catch (reason) {
         if (cancelled) return;
@@ -330,6 +456,42 @@ export default function AdminPage({
       if (timerId !== undefined) window.clearTimeout(timerId);
     };
   }, [activeDiscoveryRunId, discoveryRegionId, token]);
+
+  useEffect(() => {
+    if (activeDiscoveryRunId !== null || discoveryRun !== null || !batchRuns.length) return;
+    const latestDiscoveryRun = batchRuns.find((run) => run.kind === "place_discovery");
+    if (!latestDiscoveryRun || (latestDiscoveryRun.status !== "partial" && latestDiscoveryRun.status !== "failed")) return;
+    const requestId = ++discoveryDetailRequestId.current;
+    let cancelled = false;
+    setDiscoveryRunLoadingId(latestDiscoveryRun.id);
+    api.adminDiscoveryRun(token, latestDiscoveryRun.id)
+      .then((result) => {
+        if (!cancelled && discoveryDetailRequestId.current === requestId) setDiscoveryRun(result);
+      })
+      .catch(() => {
+        // The history row still carries the legacy summary if detailed failures are unavailable.
+        if (!cancelled && discoveryDetailRequestId.current === requestId) {
+          setDiscoveryRun({
+            run: latestDiscoveryRun,
+            created_count: latestDiscoveryRun.updated_count,
+            duplicate_count: 0,
+            invalid_count: 0,
+          });
+        }
+      })
+      .finally(() => {
+        if (discoveryDetailRequestId.current === requestId) {
+          setDiscoveryRunLoadingId((current) => current === latestDiscoveryRun.id ? null : current);
+        }
+      });
+    return () => {
+      cancelled = true;
+      if (discoveryDetailRequestId.current === requestId) {
+        discoveryDetailRequestId.current += 1;
+        setDiscoveryRunLoadingId((current) => current === latestDiscoveryRun.id ? null : current);
+      }
+    };
+  }, [activeDiscoveryRunId, batchRuns, discoveryRun, token]);
 
   useEffect(() => {
     if (activeAgentRunId === null) return;
@@ -369,6 +531,11 @@ export default function AdminPage({
     () => Math.max(1, ...summary.regions.map((region) => region.place_count)),
     [summary.regions],
   );
+  const placeDiscoveryRuns = useMemo(
+    () => batchRuns.filter((run) => run.kind === "place_discovery").slice(0, 12),
+    [batchRuns],
+  );
+  const discoveryControlsBusy = busy || activeDiscoveryRunId !== null || discoveryRunLoadingId !== null;
 
   function openPlace(place: Place) {
     setSelected(place);
@@ -468,7 +635,7 @@ export default function AdminPage({
   }
 
   async function runDiscovery() {
-    if (activeDiscoveryRunId !== null) return;
+    if (busy || activeDiscoveryRunId !== null || discoveryRunLoadingId !== null) return;
     setBusy(true);
     setError("");
     setNotice("새 장소 발굴 작업을 대기열에 등록하고 있습니다…");
@@ -480,12 +647,40 @@ export default function AdminPage({
       setDiscoveryRun(result);
       setBatchRuns((current) => [result.run, ...current.filter((run) => run.id !== result.run.id)]);
       setActiveDiscoveryRunId(result.run.id);
-      setNotice(result.run.summary || "새 장소 발굴 작업이 대기 중입니다…");
+      setNotice(plainAdminText(result.run.summary) || "새 장소 발굴 작업이 대기 중입니다…");
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "새 장소 발굴을 실행하지 못했습니다");
       setNotice("");
     } finally {
       setBusy(false);
+    }
+  }
+
+  async function inspectDiscoveryRun(run: BatchRun) {
+    if (busy || discoveryRunLoadingId !== null || activeDiscoveryRunId !== null) return;
+    const requestId = ++discoveryDetailRequestId.current;
+    setDiscoveryRunLoadingId(run.id);
+    setError("");
+    try {
+      const result = await api.adminDiscoveryRun(token, run.id);
+      if (discoveryDetailRequestId.current !== requestId) return;
+      setDiscoveryRun(result);
+      setBatchRuns((current) => current.map((item) => item.id === result.run.id ? result.run : item));
+    } catch (reason) {
+      if (discoveryDetailRequestId.current !== requestId) return;
+      if (run.status === "partial" || run.status === "failed") {
+        setDiscoveryRun({
+          run,
+          created_count: run.updated_count,
+          duplicate_count: 0,
+          invalid_count: 0,
+        });
+      }
+      setError(reason instanceof Error ? reason.message : "발굴 실행 상세를 불러오지 못했습니다");
+    } finally {
+      if (discoveryDetailRequestId.current === requestId) {
+        setDiscoveryRunLoadingId((current) => current === run.id ? null : current);
+      }
     }
   }
 
@@ -1065,7 +1260,7 @@ export default function AdminPage({
                   void loadDiscoveryCandidates(nextRegionId);
                   void loadAgentOperations(nextRegionId);
                 }}
-                disabled={busy || activeDiscoveryRunId !== null || activeAgentRunId !== null}
+                disabled={discoveryControlsBusy || activeAgentRunId !== null}
                 style={{ padding: "9px 10px", border: "1px solid var(--line)", borderRadius: 8, background: "white" }}
               >
                 <option value={0}>전체 권역 (자동 배치 권장)</option>
@@ -1079,19 +1274,65 @@ export default function AdminPage({
                 max={100}
                 value={discoveryLimit}
                 onChange={(event) => setDiscoveryLimit(Number(event.target.value) || 1)}
-                disabled={busy || activeDiscoveryRunId !== null}
+                disabled={discoveryControlsBusy}
                 style={{ width: 70, padding: "9px 10px", border: "1px solid var(--line)", borderRadius: 8 }}
               />
-              <button className="primary" type="button" onClick={() => void runDiscovery()} disabled={busy || activeDiscoveryRunId !== null}>
-                {activeDiscoveryRunId !== null ? "백그라운드 발굴 중…" : busy ? "등록 중…" : "새 후보 찾기"}
+              <button className="primary" type="button" onClick={() => void runDiscovery()} disabled={discoveryControlsBusy}>
+                {activeDiscoveryRunId !== null
+                  ? "백그라운드 발굴 중…"
+                  : discoveryRunLoadingId !== null
+                    ? "이력 확인 중…"
+                    : busy ? "등록 중…" : "새 후보 찾기"}
               </button>
             </div>
           </header>
           {activeDiscoveryRunId !== null && discoveryRun ? (
             <p className="admin__message" role="status">
-              실행 #{discoveryRun.run.id} · {discoveryRun.run.status === "queued" ? "대기 중" : "수집·검증 중"} · {discoveryRun.run.summary}
+              실행 #{discoveryRun.run.id} · {discoveryRun.run.status === "queued" ? "대기 중" : "수집·검증 중"} · {plainAdminText(discoveryRun.run.summary)}
             </p>
           ) : null}
+          {discoveryRun ? <DiscoveryFailurePanel result={discoveryRun} /> : null}
+          <section className="admin__discovery-history" aria-labelledby="discovery-history-heading">
+            <header>
+              <div>
+                <small>QUICK DISCOVERY HISTORY</small>
+                <h3 id="discovery-history-heading">최근 빠른 발굴 실행</h3>
+              </div>
+              <span>{placeDiscoveryRuns.length}건</span>
+            </header>
+            {placeDiscoveryRuns.length ? (
+              <ol>
+                {placeDiscoveryRuns.map((run) => {
+                  const canInspect = run.status === "partial" || run.status === "failed";
+                  const isSelected = discoveryRun?.run.id === run.id;
+                  return (
+                    <li key={run.id} className={isSelected ? "selected" : ""}>
+                      <i className={`batch-status batch-status--${run.status}`} aria-hidden="true" />
+                      <div>
+                        <strong>실행 #{run.id} · {batchTriggerLabel(run.trigger)}</strong>
+                        <time dateTime={run.started_at}>{batchRunDate(run.started_at).toLocaleString("ko-KR")}</time>
+                        <p>{plainAdminText(run.summary) || "실행 요약이 없습니다."}</p>
+                      </div>
+                      <span>
+                        <b className={`admin__status-badge admin__status-badge--${run.status}`}>{batchStatusLabel(run.status)}</b>
+                        <small>후보 {run.updated_count} · 조회 {run.scanned_count}</small>
+                        {canInspect ? (
+                          <button
+                            type="button"
+                            aria-pressed={isSelected}
+                            onClick={() => void inspectDiscoveryRun(run)}
+                            disabled={discoveryControlsBusy}
+                          >
+                            {discoveryRunLoadingId === run.id ? "불러오는 중…" : isSelected ? "오류 상세 표시 중" : "오류 상세 보기"}
+                          </button>
+                        ) : null}
+                      </span>
+                    </li>
+                  );
+                })}
+              </ol>
+            ) : <p className="admin__history-empty">아직 빠른 발굴 실행 이력이 없습니다.</p>}
+          </section>
           {!candidates.length ? (
             <div className="admin__empty">
               <span>⌕</span>

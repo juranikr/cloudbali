@@ -194,3 +194,35 @@ def test_unsafe_required_column_fails_before_any_schema_change(tmp_path) -> None
     }
     with engine.connect() as connection:
         assert connection.execute(text("SELECT id, value FROM items")).one() == (1, "preserve me")
+
+
+def test_discovery_failure_details_is_added_with_safe_legacy_default(tmp_path) -> None:
+    engine = create_engine(f"sqlite:///{tmp_path / 'legacy-discovery.db'}")
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "CREATE TABLE discovery_jobs ("
+                "batch_run_id INTEGER PRIMARY KEY, requested_limit INTEGER NOT NULL)"
+            )
+        )
+        connection.execute(text("INSERT INTO discovery_jobs VALUES (17, 80)"))
+
+    metadata = MetaData()
+    Table(
+        "discovery_jobs",
+        metadata,
+        Column("batch_run_id", Integer, primary_key=True),
+        Column("requested_limit", Integer, nullable=False),
+        Column("failure_details", Text, nullable=False, default="[]"),
+    )
+
+    first = run_migrations(engine, metadata=metadata)
+
+    assert first.added_columns == ("discovery_jobs.failure_details",)
+    with engine.connect() as connection:
+        assert connection.execute(
+            text("SELECT batch_run_id, requested_limit, failure_details FROM discovery_jobs")
+        ).one() == (17, 80, "[]")
+
+    second = run_migrations(engine, metadata=metadata)
+    assert second.added_columns == ()

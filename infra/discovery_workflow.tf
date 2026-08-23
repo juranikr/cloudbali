@@ -247,6 +247,36 @@ resource "aws_sns_topic_subscription" "operations_email" {
   endpoint  = trimspace(var.operations_alert_email)
 }
 
+resource "aws_cloudwatch_log_metric_filter" "discovery_partial" {
+  name           = "cloudbali-prod-discovery-partial"
+  pattern        = "{ $.status = \"partial\" }"
+  log_group_name = aws_cloudwatch_log_group.discovery.name
+
+  metric_transformation {
+    name      = "PartialExecutions"
+    namespace = "CloudBali/Discovery"
+    value     = "1"
+    unit      = "Count"
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "discovery_partial" {
+  alarm_name          = "cloudbali-prod-discovery-partial"
+  alarm_description   = "A place-discovery worker completed with one or more failed regions"
+  namespace           = "CloudBali/Discovery"
+  metric_name         = "PartialExecutions"
+  statistic           = "Sum"
+  period              = 300
+  evaluation_periods  = 1
+  threshold           = 1
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  treat_missing_data  = "notBreaching"
+
+  alarm_actions = [aws_sns_topic.operations_alerts.arn]
+
+  depends_on = [aws_cloudwatch_log_metric_filter.discovery_partial]
+}
+
 resource "aws_cloudwatch_metric_alarm" "discovery_failed" {
   alarm_name          = "cloudbali-prod-discovery-failed"
   alarm_description   = "The durable place-discovery workflow failed after retries"
