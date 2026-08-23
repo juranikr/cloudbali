@@ -20,7 +20,10 @@ data "aws_iam_policy_document" "github_assume" {
     condition {
       test     = "StringLike"
       variable = "token.actions.githubusercontent.com:sub"
-      values   = ["repo:juranikr/cloudbali:*"]
+      values = [
+        "repo:juranikr/cloudbali:*",
+        "repo:juranikr@*/cloudbali@*:*",
+      ]
     }
   }
 }
