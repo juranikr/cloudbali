@@ -507,6 +507,7 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 3px s
 .admin__batch article span strong, .admin__batch article span small { display: block; }
 .admin__batch article span strong { font-size: .67rem; }
 .admin__batch article span small { margin-top: 4px; color: var(--muted); font-size: .55rem; }
+.admin__candidate-description { display: -webkit-box; margin: 8px 0 5px; overflow: hidden; color: #344b44; font-size: .62rem; line-height: 1.65; -webkit-box-orient: vertical; -webkit-line-clamp: 3; }
 .admin__batch article > div { display: grid; justify-items: end; gap: 4px; }
 .admin__batch article b { font-size: .55rem; text-transform: uppercase; }
 .admin__batch article em { color: var(--muted); font-size: .52rem; font-style: normal; }

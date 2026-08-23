@@ -19,6 +19,7 @@ from fastapi.testclient import TestClient
 from app.db import SessionLocal
 from app.main import app
 from app.discovery import (
+    _candidate_values,
     _claim_discovery_run,
     _locked_active_places_by_region,
     create_discovery_run,
@@ -99,7 +100,11 @@ def test_admin_discovery_requires_review_and_keeps_decision_history() -> None:
         candidate = next(item for item in candidates.json() if item["external_id"] == "node/987654321")
         assert candidate["source"] == "openstreetmap"
         assert candidate["result_place_id"] is None
+        assert "우붓 권역" in candidate["description"]
+        assert "관광 명소" in candidate["description"]
+        assert "A locally mapped garden" not in candidate["description"]
         assert '"coordinate_crs":"WGS84"' in candidate["evidence"]
+        assert "A locally mapped garden" in candidate["evidence"]
 
         before = client.get("/api/admin/places", headers=admin).json()
         assert all(item["title"] != "Subak Discovery Garden" for item in before)
@@ -151,6 +156,143 @@ def test_admin_discovery_requires_review_and_keeps_decision_history() -> None:
         assert rejected.status_code == 200
         assert rejected.json()["status"] == "rejected"
         assert rejected.json()["decision_history"][-1]["action"] == "rejected"
+
+
+def test_candidate_description_uses_controlled_osm_tags_in_korean() -> None:
+    region = SimpleNamespace(
+        name_ko="우붓",
+        south=-8.58,
+        west=115.20,
+        north=-8.40,
+        east=115.36,
+    )
+    element = {
+        "type": "node",
+        "id": 801_234_590,
+        "lat": -8.52,
+        "lon": 115.28,
+        "tags": {
+            "name": "Sample Warung",
+            "amenity": "restaurant",
+            "cuisine": "indonesian;seafood;unmapped_value",
+            "description:en": "A popular hidden gem according to an editor.",
+        },
+    }
+
+    values = _candidate_values(region, element)
+
+    assert values is not None
+    assert values.description == (
+        "우붓 권역에 있는 장소로, OpenStreetMap에는 음식점 유형으로 등록되어 있습니다. "
+        "요리 태그에는 인도네시아 요리, 해산물 정보가 포함되어 있습니다."
+    )
+    assert "hidden gem" not in values.description
+    assert "A popular hidden gem" in values.evidence
+
+
+def test_candidate_description_keeps_a_korean_source_description() -> None:
+    region = SimpleNamespace(
+        name_ko="우붓",
+        south=-8.58,
+        west=115.20,
+        north=-8.40,
+        east=115.36,
+    )
+    element = {
+        "type": "node",
+        "id": 801_234_591,
+        "lat": -8.52,
+        "lon": 115.28,
+        "tags": {
+            "name": "Sample Museum",
+            "tourism": "museum",
+            "description:ko": "지역 공예품을 전시하는 작은 박물관입니다.",
+            "description:en": "A small craft museum.",
+        },
+    }
+
+    values = _candidate_values(region, element)
+
+    assert values is not None
+    assert values.description == "지역 공예품을 전시하는 작은 박물관입니다."
+
+
+def test_candidate_description_covers_observed_discovery_types() -> None:
+    region = SimpleNamespace(
+        name_ko="우붓",
+        south=-8.58,
+        west=115.20,
+        north=-8.40,
+        east=115.36,
+    )
+    cases = [
+        ({"tourism": "artwork"}, "예술 작품"),
+        ({"tourism": "attraction"}, "관광 명소"),
+        ({"tourism": "museum"}, "박물관"),
+        ({"tourism": "viewpoint"}, "전망대"),
+        ({"natural": "peak"}, "산봉우리"),
+        ({"historic": "monument"}, "기념물"),
+        ({"amenity": "place_of_worship", "religion": "hindu"}, "힌두교 종교 시설"),
+        ({"amenity": "restaurant"}, "음식점"),
+    ]
+
+    for offset, (type_tags, expected_label) in enumerate(cases):
+        values = _candidate_values(region, {
+            "type": "node",
+            "id": 801_234_600 + offset,
+            "lat": -8.52,
+            "lon": 115.28,
+            "tags": {"name": f"Observed type {offset}", **type_tags},
+        })
+        assert values is not None
+        assert expected_label in values.description
+
+
+def test_candidate_list_supplies_korean_fallback_for_legacy_blank_description() -> None:
+    with TestClient(app) as client:
+        admin = _login(client, "joohan92@naver.com", "admin-test-password")
+        regions = client.get("/api/regions", headers=admin).json()
+        ubud_id = next(item["id"] for item in regions if item["slug"] == "ubud")
+        with SessionLocal() as db:
+            run = BatchRun(kind="place_discovery", status="success", trigger="manual")
+            db.add(run)
+            db.flush()
+            candidate = DiscoveryCandidate(
+                discovery_run_id=run.id,
+                region_id=ubud_id,
+                source="openstreetmap",
+                external_id="node/801234699",
+                source_url="https://www.openstreetmap.org/node/801234699",
+                title="Legacy Blank Artwork",
+                local_name="",
+                description="",
+                area="",
+                category="culture",
+                lat=-8.52,
+                lng=115.28,
+                confidence=0.7,
+                evidence=json.dumps({
+                    "matched_rule": "cultural=artwork",
+                    "osm_tags": {"name": "Legacy Blank Artwork", "tourism": "artwork"},
+                }),
+                tags="culture,artwork",
+                status="pending",
+            )
+            db.add(candidate)
+            db.commit()
+            candidate_id = candidate.id
+
+        response = client.get(
+            "/api/admin/discovery/candidates",
+            headers=admin,
+            params={"region_id": ubud_id, "limit": 200},
+        )
+
+        assert response.status_code == 200
+        row = next(item for item in response.json() if item["id"] == candidate_id)
+        assert row["description"] == (
+            "우붓 권역에 있는 장소로, OpenStreetMap에는 예술 작품 유형으로 등록되어 있습니다."
+        )
 
 
 def test_discovery_locks_multi_region_places_with_one_global_id_query() -> None:

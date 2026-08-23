@@ -42,6 +42,17 @@ function candidateConfidence(value: number) {
 }
 
 
+function candidateDescription(candidate: DiscoveryCandidate) {
+  const description = (candidate.description || "").replace(/\s+/g, " ").trim();
+  if (description) {
+    const sentences = description.match(/[^.!?。！？]+[.!?。！？]?/g) || [description];
+    return sentences.slice(0, 2).map((sentence) => sentence.trim()).filter(Boolean).join(" ");
+  }
+  const category = CATEGORIES.find(([value]) => value === candidate.category)?.[1] || "여행";
+  return `${candidate.region_name}에서 발견한 ${category} 장소 후보입니다. 공개하기 전에 위치와 운영 상태를 확인해 주세요.`;
+}
+
+
 function candidateEvidence(value: string) {
   try {
     const parsed = JSON.parse(value) as unknown;
@@ -1091,12 +1102,14 @@ export default function AdminPage({
           {candidates.map((candidate) => {
             const evidence = candidateEvidence(candidate.evidence);
             const inactiveReason = candidateInactiveReason(candidate.evidence);
+            const description = candidateDescription(candidate);
             return (
               <article key={candidate.id}>
                 <i className={candidate.confidence >= 0.8 ? "batch-status--success" : candidate.confidence >= 0.6 ? "batch-status--partial" : ""} />
                 <span>
                   <strong>{candidate.title}{candidate.local_name ? " · " + candidate.local_name : ""}</strong>
                   <small>{candidate.region_name} · {candidate.category} · {candidate.lat.toFixed(5)}, {candidate.lng.toFixed(5)}</small>
+                  <p className="admin__candidate-description" title={candidate.description || description}>{description}</p>
                   <small title={evidence}>{inactiveReason ? `등록 차단 · 폐업/철거 신호: ${inactiveReason}` : evidence || "수집된 근거 요약이 없습니다."}</small>
                   <small>
                     {candidate.source_url ? <a href={candidate.source_url} target="_blank" rel="noreferrer">{candidate.source || "근거 원문"} ↗</a> : candidate.source}

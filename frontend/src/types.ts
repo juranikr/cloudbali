@@ -194,6 +194,7 @@ export type DiscoveryCandidate = {
   region_name: string;
   title: string;
   local_name: string;
+  description: string;
   category: string;
   lat: number;
   lng: number;

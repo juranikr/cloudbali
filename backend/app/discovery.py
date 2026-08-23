@@ -213,6 +213,153 @@ def _clean_text(value: object, max_length: int) -> str:
     return " ".join(value.split())[:max_length]
 
 
+_HANGUL_PATTERN = re.compile(r"[\uac00-\ud7a3]")
+
+_CATEGORY_LABELS_KO = {
+    "transport": "교통 시설",
+    "surf": "서핑 관련 장소",
+    "dive": "다이빙·스노클링 관련 장소",
+    "beach": "해변",
+    "wellness": "스파·웰니스 시설",
+    "cafe": "카페",
+    "food": "음식점",
+    "nightlife": "바·나이트라이프 장소",
+    "culture": "문화 명소",
+    "nature": "자연 명소",
+    "other": "관광 명소",
+}
+
+_CUISINE_LABELS_KO = {
+    "asian": "아시아 요리",
+    "balinese": "발리 요리",
+    "burger": "버거",
+    "chinese": "중식",
+    "coffee_shop": "커피",
+    "ice_cream": "아이스크림",
+    "indonesian": "인도네시아 요리",
+    "italian": "이탈리아 요리",
+    "japanese": "일식",
+    "pizza": "피자",
+    "seafood": "해산물",
+    "vegan": "비건 요리",
+    "vegetarian": "채식 요리",
+}
+
+
+def _osm_type_label_ko(tags: dict[str, str], category: str) -> str:
+    """Translate controlled OSM enum tags without translating free-text claims."""
+
+    amenity = tags.get("amenity", "").casefold()
+    tourism = tags.get("tourism", "").casefold()
+    natural = tags.get("natural", "").casefold()
+    historic = tags.get("historic", "").casefold()
+    leisure = tags.get("leisure", "").casefold()
+    sport = tags.get("sport", "").casefold()
+    shop = tags.get("shop", "").casefold()
+
+    if amenity == "ferry_terminal":
+        return "여객선 터미널"
+    if leisure == "marina":
+        return "마리나·선착장"
+    if sport == "surfing":
+        return "서핑 관련 장소"
+    if sport in {"scuba_diving", "diving", "snorkelling"} or shop == "scuba_diving":
+        return "다이빙·스노클링 관련 장소"
+    if natural == "beach":
+        return "해변"
+    if leisure == "spa":
+        return "스파·웰니스 시설"
+    if amenity == "cafe":
+        return "카페"
+    if amenity == "restaurant":
+        return "음식점"
+    if amenity == "food_court":
+        return "푸드코트"
+    if amenity == "bar":
+        return "바"
+    if amenity == "marketplace":
+        return "시장"
+    if amenity == "place_of_worship":
+        religions = {
+            "buddhist": "불교",
+            "christian": "기독교",
+            "hindu": "힌두교",
+            "muslim": "이슬람교",
+        }
+        religion = religions.get(tags.get("religion", "").casefold())
+        return f"{religion} 종교 시설" if religion else "종교 시설"
+
+    historic_labels = {
+        "archaeological_site": "고고학 유적",
+        "memorial": "추모 시설",
+        "monument": "기념물",
+        "ruins": "유적",
+        "temple": "역사적 사원",
+    }
+    if historic in historic_labels:
+        return historic_labels[historic]
+    tourism_labels = {
+        "aquarium": "수족관",
+        "artwork": "예술 작품",
+        "attraction": "관광 명소",
+        "gallery": "갤러리",
+        "museum": "박물관",
+        "theme_park": "테마파크",
+        "viewpoint": "전망대",
+        "zoo": "동물원",
+    }
+    if tourism in tourism_labels:
+        return tourism_labels[tourism]
+    natural_labels = {
+        "hot_spring": "온천",
+        "peak": "산봉우리",
+        "reef": "산호초",
+        "waterfall": "폭포",
+    }
+    if natural in natural_labels:
+        return natural_labels[natural]
+    leisure_labels = {
+        "nature_reserve": "자연보호구역",
+        "water_park": "워터파크",
+    }
+    if leisure in leisure_labels:
+        return leisure_labels[leisure]
+    return _CATEGORY_LABELS_KO.get(category, "여행 장소")
+
+
+def _candidate_description_ko(
+    region: Region,
+    tags: dict[str, str],
+    category: str,
+    *,
+    source_label: str = "OpenStreetMap",
+) -> str:
+    """Build a concise Korean summary from sourced, controlled enum tags."""
+
+    source_description = (
+        _clean_text(tags.get("description:ko"), 5000)
+        or _clean_text(tags.get("description"), 5000)
+    )
+    if _HANGUL_PATTERN.search(source_description):
+        return source_description
+
+    region_name = _clean_text(region.name_ko, 100) or "선택한"
+    place_type = _osm_type_label_ko(tags, category)
+    description = (
+        f"{region_name} 권역에 있는 장소로, "
+        f"{source_label}에는 {place_type} 유형으로 등록되어 있습니다."
+    )
+    cuisine_values = re.split(r"[;,]", tags.get("cuisine", "").casefold())
+    cuisines = list(dict.fromkeys(
+        _CUISINE_LABELS_KO[value.strip()]
+        for value in cuisine_values
+        if value.strip() in _CUISINE_LABELS_KO
+    ))
+    if cuisines:
+        description += f" 요리 태그에는 {', '.join(cuisines[:3])} 정보가 포함되어 있습니다."
+    return description
+
+
 _INACTIVE_LIFECYCLE_PREFIXES = ("disused", "abandoned", "demolished", "razed", "removed")
 _INACTIVE_EXPLICIT_VALUES = {
     "1", "yes", "true", "closed", "permanently_closed", "permanently closed",
@@ -499,11 +646,7 @@ def _candidate_values(region: Region, element: dict) -> CandidateValues | None:
     local_name = _clean_text(tags.get("name:id"), 180) or name
     if local_name.casefold() == title.casefold():
         local_name = ""
-    description = (
-        _clean_text(tags.get("description:ko"), 5000)
-        or _clean_text(tags.get("description:en"), 5000)
-        or _clean_text(tags.get("description"), 5000)
-    )
+    description = _candidate_description_ko(region, tags, category)
     area = (
         _clean_text(tags.get("addr:suburb"), 100)
         or _clean_text(tags.get("addr:village"), 100)
@@ -1002,6 +1145,14 @@ def _execute_discovery_run(db: Session, run_id: int) -> DiscoveryRunOut:
                         created += 1
                         region_created += 1
                         continue
+                    # Refresh only legacy blank/English summaries when this
+                    # exact source object is encountered again. A Korean text
+                    # already reviewed by an administrator is never replaced.
+                    if (
+                        values.description
+                        and not _HANGUL_PATTERN.search(existing_candidate.description or "")
+                    ):
+                        existing_candidate.description = values.description
                     duplicates += 1
                     continue
                 if _candidate_duplicates(values, candidates_by_region[region.id]):
@@ -1251,13 +1402,45 @@ def run_discovery(
     return _execute_discovery_run(db, queued.run.id)
 
 
+def _effective_candidate_description(candidate: DiscoveryCandidate) -> str:
+    """Return a Korean display/publish fallback for legacy candidate rows."""
+
+    stored = _clean_text(candidate.description, 5000)
+    if _HANGUL_PATTERN.search(stored):
+        return stored
+    try:
+        evidence = json.loads(candidate.evidence or "{}")
+    except (TypeError, json.JSONDecodeError):
+        evidence = {}
+    raw_tags = evidence.get("osm_tags") if isinstance(evidence, dict) else None
+    tags = (
+        {str(key): str(value) for key, value in raw_tags.items() if value is not None}
+        if isinstance(raw_tags, dict)
+        else {}
+    )
+    source_labels = {
+        "openstreetmap": "OpenStreetMap",
+        "wikidata": "Wikidata",
+    }
+    source_label = source_labels.get(
+        str(candidate.source or "").strip().casefold(),
+        "공개 출처",
+    )
+    return _candidate_description_ko(
+        candidate.region,
+        tags,
+        candidate.category,
+        source_label=source_label,
+    )
+
+
 def _values_from_candidate(candidate: DiscoveryCandidate) -> CandidateValues:
     return CandidateValues(
         external_id=candidate.external_id,
         source_url=candidate.source_url,
         title=candidate.title,
         local_name=candidate.local_name,
-        description=candidate.description,
+        description=_effective_candidate_description(candidate),
         area=candidate.area,
         category=candidate.category,
         lat=candidate.lat,
@@ -1292,7 +1475,7 @@ def candidate_out(candidate: DiscoveryCandidate) -> DiscoveryCandidateOut:
         source_url=candidate.source_url,
         title=candidate.title,
         local_name=candidate.local_name,
-        description=candidate.description,
+        description=_effective_candidate_description(candidate),
         area=candidate.area,
         category=candidate.category,
         lat=candidate.lat,
@@ -1480,7 +1663,7 @@ def approve_candidate(
         category=candidate.category,
         title=candidate.title,
         local_name=candidate.local_name,
-        description=candidate.description or "공개 출처에서 발굴해 관리자가 검토·승인한 장소입니다.",
+        description=_effective_candidate_description(candidate),
         area=candidate.area,
         lat=candidate.lat,
         lng=candidate.lng,
