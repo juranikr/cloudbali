@@ -8,7 +8,8 @@ from urllib.request import Request, urlopen
 
 from sqlalchemy.orm import Session
 
-from app.db import Base, SessionLocal, engine
+from app.db import SessionLocal, engine
+from app.migrations import run_migrations
 from app.models import BatchRun, Place, Region, RegionSnapshot
 
 
@@ -60,7 +61,7 @@ def run_batch(db: Session, *, trigger: str = "schedule") -> BatchRun:
     try:
         db.refresh(run)
         regions = db.query(Region).order_by(Region.sort_order, Region.id).all()
-        places = db.query(Place).all()
+        places = db.query(Place).filter(Place.merged_into_id.is_(None)).all()
         updated = 0
         failures: list[str] = []
         results: dict[int, dict] = {}
@@ -113,7 +114,7 @@ def run_batch(db: Session, *, trigger: str = "schedule") -> BatchRun:
 
 
 def main() -> None:
-    Base.metadata.create_all(bind=engine)
+    run_migrations(engine)
     with SessionLocal() as db:
         run = run_batch(db)
         print(json.dumps({

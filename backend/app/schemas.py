@@ -63,6 +63,8 @@ class PlaceCreate(BaseModel):
     tags: list[str] = Field(default_factory=list)
     source_url: str = Field(default="", max_length=1000)
     coordinate_source: str = Field(default="manual", max_length=60)
+    coordinate_external_id: str = Field(default="", max_length=200)
+    coordinate_confidence: float | None = Field(default=None, ge=0, le=1)
 
 
 class PlaceUpdate(BaseModel):
@@ -107,6 +109,9 @@ class AdminPlaceUpdate(BaseModel):
     traveler_note: str | None = Field(default=None, max_length=5000)
     tags: list[str] | None = None
     source_url: str | None = Field(default=None, max_length=1000)
+    coordinate_source: str | None = Field(default=None, max_length=60)
+    coordinate_external_id: str | None = Field(default=None, max_length=200)
+    coordinate_confidence: float | None = Field(default=None, ge=0, le=1)
 
     @model_validator(mode="after")
     def reject_explicit_nulls(self):
@@ -139,7 +144,13 @@ class PlaceOut(BaseModel):
     tags: list[str]
     source_url: str
     coordinate_source: str
+    coordinate_external_id: str = ""
+    coordinate_confidence: float | None = None
+    coordinate_verified_at: datetime | None = None
     coordinate_crs: str
+    chain_id: int | None = None
+    branch_name: str = ""
+    merged_into_id: int | None = None
     is_favorite: bool
     is_seed: bool
     created_at: datetime
@@ -160,6 +171,18 @@ class SearchHit(BaseModel):
     region_id: int | None = None
     place_id: int | None = None
     category: str = "other"
+    source_url: str = ""
+    source_urls: list[str] = Field(default_factory=list)
+    external_id: str = ""
+    external_ids: dict[str, str] = Field(default_factory=dict)
+    coordinate_source: str = ""
+    confidence: float = Field(default=0.5, ge=0, le=1)
+    cross_checked: bool = False
+    storage_allowed: bool = False
+    attribution: str = ""
+    license: str = ""
+    license_url: str = ""
+    sources: list[str] = Field(default_factory=list)
 
 
 class TripStopCreate(BaseModel):
@@ -183,9 +206,29 @@ class TripStopOut(BaseModel):
 
 
 class ChatRequest(BaseModel):
-    message: str = Field(min_length=1, max_length=2000)
+    message: str = Field(min_length=1, max_length=3000)
     region_id: int | None = Field(default=None, gt=0)
     selected_place_id: int | None = Field(default=None, gt=0)
+
+
+class ChatCandidateOut(BaseModel):
+    key: str
+    title: str
+    display_name: str = ""
+    region_id: int | None = None
+    category: str = "other"
+    status: str = "grounded"
+    source: str = ""
+    source_urls: list[str] = Field(default_factory=list)
+    external_id: str = ""
+    lat: float | None = None
+    lng: float | None = None
+    confidence: float = Field(default=0.0, ge=0, le=1)
+    cross_checked: bool = False
+    storage_allowed: bool = False
+    license: str = ""
+    attribution: str = ""
+    proposal_id: int | None = None
 
 
 class ChatMessageOut(BaseModel):
@@ -195,12 +238,16 @@ class ChatMessageOut(BaseModel):
     content: str
     model: str
     place_ids: list[int]
+    sources: list[str] = Field(default_factory=list)
+    candidates: list[ChatCandidateOut] = Field(default_factory=list)
     created_at: datetime
 
 
 class ChatResponse(BaseModel):
     message: ChatMessageOut
     grounded_places: list[PlaceOut]
+    model: str = ""
+    work_state: dict = Field(default_factory=dict)
 
 
 class RegionSnapshotOut(BaseModel):

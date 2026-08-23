@@ -4,7 +4,12 @@ import type {
   PlaceChangeEvent,
   PlaceImage,
   PlaceImageDraft,
+  PlaceChain,
+  PlaceContributor,
+  PlaceInsight,
+  PlaceInsightDraft,
   PlaceNote,
+  UploadPresign,
 } from "./placeCollaborationTypes";
 
 
@@ -50,18 +55,18 @@ export function listPlaceNotes(token: string, placeId: number): Promise<PlaceNot
 }
 
 
-export function createPlaceNote(token: string, placeId: number, content: string): Promise<PlaceNote> {
+export function createPlaceNote(token: string, placeId: number, content: string, visibility: "shared" | "private" = "shared"): Promise<PlaceNote> {
   return request(`/api/places/${placeId}/notes`, token, {
     method: "POST",
-    body: JSON.stringify({ content }),
+    body: JSON.stringify({ content, visibility }),
   });
 }
 
 
-export function updatePlaceNote(token: string, noteId: number, content: string): Promise<PlaceNote> {
+export function updatePlaceNote(token: string, noteId: number, content: string, visibility?: "shared" | "private"): Promise<PlaceNote> {
   return request(`/api/notes/${noteId}`, token, {
     method: "PATCH",
-    body: JSON.stringify({ content }),
+    body: JSON.stringify({ content, ...(visibility ? { visibility } : {}) }),
   });
 }
 
@@ -134,4 +139,72 @@ export function createPlaceAppeal(token: string, body: AppealDraft): Promise<Pla
 export function listMyPlaceAppeals(token: string, limit = 100): Promise<PlaceAppeal[]> {
   const query = new URLSearchParams({ limit: String(limit) });
   return request(`/api/appeals/mine?${query.toString()}`, token);
+}
+
+export function listPlaceContributors(token: string, placeId: number): Promise<PlaceContributor[]> {
+  return request(`/api/places/${placeId}/contributors`, token);
+}
+
+export function invitePlaceContributor(token: string, placeId: number, email: string): Promise<PlaceContributor> {
+  return request(`/api/places/${placeId}/contributors`, token, {
+    method: "POST",
+    body: JSON.stringify({ email, role: "editor" }),
+  });
+}
+
+export function removePlaceContributor(token: string, placeId: number, userId: number): Promise<void> {
+  return request(`/api/places/${placeId}/contributors/${userId}`, token, { method: "DELETE" });
+}
+
+export function listPlaceInsights(token: string, placeId: number): Promise<PlaceInsight[]> {
+  return request(`/api/places/${placeId}/insights`, token);
+}
+
+export function createPlaceInsight(token: string, placeId: number, body: PlaceInsightDraft): Promise<PlaceInsight> {
+  return request(`/api/places/${placeId}/insights`, token, { method: "POST", body: JSON.stringify(body) });
+}
+
+export function updatePlaceInsight(token: string, insightId: number, body: Partial<PlaceInsightDraft>): Promise<PlaceInsight> {
+  return request(`/api/place-insights/${insightId}`, token, { method: "PATCH", body: JSON.stringify(body) });
+}
+
+export function deletePlaceInsight(token: string, insightId: number): Promise<void> {
+  return request(`/api/place-insights/${insightId}`, token, { method: "DELETE" });
+}
+
+export function listChains(token: string): Promise<PlaceChain[]> {
+  return request("/api/chains", token);
+}
+
+export function assignPlaceChain(token: string, placeId: number, chainId: number, branchName: string): Promise<PlaceChain> {
+  return request(`/api/places/${placeId}/chain`, token, {
+    method: "PUT",
+    body: JSON.stringify({ chain_id: chainId, branch_name: branchName }),
+  });
+}
+
+export function unassignPlaceChain(token: string, placeId: number): Promise<void> {
+  return request(`/api/places/${placeId}/chain`, token, { method: "DELETE" });
+}
+
+export async function uploadPlaceImage(
+  token: string,
+  placeId: number,
+  file: File,
+  caption: string,
+): Promise<void> {
+  const presign = await request<UploadPresign>(`/api/places/${placeId}/images/presign`, token, {
+    method: "POST",
+    body: JSON.stringify({ filename: file.name, content_type: file.type, size_bytes: file.size }),
+  });
+  const uploadResponse = await fetch(presign.upload_url, {
+    method: presign.method,
+    headers: presign.headers,
+    body: file,
+  });
+  if (!uploadResponse.ok) throw new Error("이미지 파일을 저장소에 업로드하지 못했습니다");
+  await request(`/api/places/${placeId}/images/complete`, token, {
+    method: "POST",
+    body: JSON.stringify({ s3_key: presign.s3_key, caption, source_url: "" }),
+  });
 }

@@ -13,6 +13,7 @@ from app.db import SessionLocal
 from app.extended_models import PlaceChangeEvent
 from app.itinerary_api import router as itinerary_router
 from app.main import app
+from app.models import Place
 
 
 if not any(getattr(route, "path", "") == "/api/itineraries" for route in app.routes):
@@ -286,3 +287,44 @@ def test_place_used_by_itinerary_returns_conflict_for_user_and_admin_delete() ->
             assert deletion is not None
             assert "deleted_place" in deletion.metadata_json
         assert client.delete(f"/api/itineraries/{plan_id}", headers=owner).status_code == 204
+
+
+def test_itinerary_cannot_create_or_retarget_items_to_a_merged_source_place() -> None:
+    with TestClient(app) as client:
+        owner = _login(client, "joohan92@naver.com", "admin-test-password")
+        places = client.get("/api/places", headers=owner).json()
+        source_id, target_id = places[0]["id"], places[1]["id"]
+        with SessionLocal() as db:
+            source = db.get(Place, source_id)
+            source.merged_into_id = target_id
+            db.commit()
+
+        plan = client.post(
+            "/api/itineraries", headers=owner,
+            json={"title": "병합 장소 보호", "start_date": "2026-11-01", "end_date": "2026-11-01"},
+        ).json()
+        day = client.post(
+            f"/api/itineraries/{plan['id']}/days", headers=owner,
+            json={"calendar_date": "2026-11-01"},
+        ).json()
+        blocked_create = client.post(
+            f"/api/itineraries/{plan['id']}/days/{day['id']}/items",
+            headers=owner, json={"place_id": source_id},
+        )
+        assert blocked_create.status_code == 404
+
+        created = client.post(
+            f"/api/itineraries/{plan['id']}/days/{day['id']}/items",
+            headers=owner, json={"place_id": target_id},
+        )
+        assert created.status_code == 201
+        blocked_update = client.patch(
+            f"/api/itineraries/{plan['id']}/items/{created.json()['id']}",
+            headers=owner, json={"place_id": source_id},
+        )
+        assert blocked_update.status_code == 404
+        assert client.delete(f"/api/itineraries/{plan['id']}", headers=owner).status_code == 204
+        with SessionLocal() as db:
+            source = db.get(Place, source_id)
+            source.merged_into_id = None
+            db.commit()

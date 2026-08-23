@@ -1,0 +1,45 @@
+.traveler-drawer { position: fixed; z-index: 1320; top: 76px; right: 16px; bottom: 16px; width: min(470px, calc(100vw - 32px)); overflow: hidden; border: 1px solid var(--line); border-radius: 22px; background: var(--paper); box-shadow: 0 24px 80px rgba(23,55,48,.24); }
+.traveler-drawer > header { display: flex; padding: 24px; justify-content: space-between; gap: 16px; background: var(--forest); color: white; }
+.traveler-drawer > header p { margin: 0; color: var(--sun); font-size: .56rem; font-weight: 800; letter-spacing: .16em; }
+.traveler-drawer > header h2 { margin: 5px 0; font: 1.65rem "DM Serif Display", "Noto Sans KR", serif; }
+.traveler-drawer > header small { color: rgba(255,255,255,.65); font-size: .56rem; }
+.traveler-drawer > header button { width: 34px; height: 34px; border: 0; border-radius: 50%; background: rgba(255,255,255,.12); color: white; cursor: pointer; }
+.traveler-drawer > nav { display: flex; padding: 10px 14px; border-bottom: 1px solid var(--line); gap: 5px; }
+.traveler-drawer > nav button { padding: 8px 10px; border: 0; border-radius: 8px; background: transparent; color: var(--muted); font-size: .62rem; font-weight: 800; cursor: pointer; }
+.traveler-drawer > nav button.active { background: #e7f0eb; color: var(--forest); }
+.traveler-drawer > nav button:last-child { margin-left: auto; }
+.traveler-drawer > nav b { display: inline-grid; min-width: 17px; height: 17px; margin-left: 4px; border-radius: 50%; place-items: center; background: var(--coral); color: white; font-size: .48rem; }
+.traveler-drawer__error, .traveler-drawer__loading { margin: 12px 16px; padding: 10px; border-radius: 9px; background: #fae3db; color: #9b402d; font-size: .6rem; }
+.traveler-drawer__loading { background: #edf4f0; color: var(--forest); }
+.traveler-messages, .traveler-profile { height: calc(100% - 157px); padding: 16px; overflow-y: auto; }
+.traveler-messages > header, .traveler-profile > header { display: flex; margin-bottom: 10px; justify-content: space-between; align-items: center; }
+.traveler-messages > header strong, .traveler-profile > header strong { font-size: .72rem; }
+.traveler-messages > header button, .traveler-messages > header span, .traveler-profile > header small { border: 0; background: transparent; color: var(--muted); font-size: .55rem; }
+.traveler-messages > button { display: grid; grid-template-columns: 14px 1fr auto; width: 100%; padding: 13px 9px; border: 0; border-bottom: 1px solid var(--line); gap: 8px; background: transparent; text-align: left; cursor: pointer; }
+.traveler-messages > button.unread { border-radius: 10px; background: #f0f6f2; }
+.traveler-messages > button i { color: #a3aaa6; font-size: .48rem; font-style: normal; }
+.traveler-messages > button.unread i { color: var(--coral); }
+.traveler-messages > button small, .traveler-messages > button strong, .traveler-messages > button p { display: block; }
+.traveler-messages > button small { color: var(--coral); font-size: .49rem; text-transform: uppercase; }
+.traveler-messages > button strong { margin-top: 4px; font-size: .66rem; }
+.traveler-messages > button p { margin: 5px 0 0; color: var(--muted); font-size: .56rem; line-height: 1.55; }
+.traveler-messages > button em { align-self: center; color: var(--forest); font-size: .5rem; font-style: normal; white-space: nowrap; }
+.traveler-empty { display: grid; min-height: 220px; align-content: center; justify-items: center; color: var(--muted); text-align: center; }
+.traveler-empty span { color: var(--coral); font-size: 1.8rem; }
+.traveler-empty strong { margin-top: 8px; font-size: .7rem; }
+.traveler-empty p { max-width: 280px; font-size: .57rem; line-height: 1.6; }
+.traveler-profile > header p { margin: 4px 0 0; color: var(--muted); font-size: .54rem; }
+.traveler-profile__signals { display: flex; margin: 14px 0; flex-wrap: wrap; gap: 6px; }
+.traveler-profile__signals span { display: flex; padding: 7px 9px; border-radius: 999px; gap: 6px; background: #e7f0eb; color: var(--forest); font-size: .55rem; }
+.traveler-profile__signals em { color: var(--coral); font-style: normal; }
+.traveler-profile__evidence { display: flex; padding: 10px; border: 1px solid var(--line); border-radius: 10px; flex-wrap: wrap; gap: 9px; }
+.traveler-profile__evidence span { color: var(--muted); font-size: .49rem; }
+.traveler-profile__evidence b { color: var(--forest); }
+.traveler-profile__recommendations { display: grid; margin-top: 12px; gap: 7px; }
+.traveler-profile__recommendations button { display: flex; padding: 12px; border: 1px solid var(--line); border-radius: 11px; justify-content: space-between; gap: 10px; background: white; text-align: left; cursor: pointer; }
+.traveler-profile__recommendations small, .traveler-profile__recommendations strong, .traveler-profile__recommendations p { display: block; }
+.traveler-profile__recommendations small { color: var(--coral); font-size: .48rem; }
+.traveler-profile__recommendations strong { margin-top: 3px; font-size: .65rem; }
+.traveler-profile__recommendations p { margin: 4px 0 0; color: var(--muted); font-size: .52rem; }
+.traveler-profile__recommendations button > b { color: var(--coral); font: 1rem "DM Serif Display", serif; }
+@media (max-width: 780px) { .traveler-drawer { inset: 0; width: 100%; border: 0; border-radius: 0; } .traveler-messages, .traveler-profile { height: calc(100% - 147px); } }

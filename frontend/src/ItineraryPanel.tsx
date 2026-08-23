@@ -2,6 +2,7 @@ import { FormEvent, useEffect, useMemo, useState } from "react";
 import * as itineraryApi from "./itineraryApi";
 import type {
   ItineraryCreate,
+  ItineraryDay,
   ItineraryDetail,
   ItineraryItem,
   ItineraryMemberRole,
@@ -145,6 +146,10 @@ export default function ItineraryPanel({
     end_time: "",
     note: "",
   });
+  const [editingDayId, setEditingDayId] = useState<number | null>(null);
+  const [dayEdit, setDayEdit] = useState({ title: "", note: "" });
+  const [editingItemId, setEditingItemId] = useState<number | null>(null);
+  const [itemEdit, setItemEdit] = useState({ start_time: "", end_time: "", note: "" });
   const [memberEmail, setMemberEmail] = useState("");
   const [memberRole, setMemberRole] = useState<ItineraryMemberRole>("viewer");
   const [sharePath, setSharePath] = useState("");
@@ -220,6 +225,16 @@ export default function ItineraryPanel({
   }, [selectedPlanId, token]);
 
   useEffect(() => {
+    if (!selectedPlanId) return;
+    const timerId = window.setInterval(() => {
+      void itineraryApi.getItinerary(token, selectedPlanId)
+        .then(setDetail)
+        .catch(() => { /* Keep the last good schedule; explicit refresh shows errors. */ });
+    }, 30_000);
+    return () => window.clearInterval(timerId);
+  }, [selectedPlanId, token]);
+
+  useEffect(() => {
     if (!detail) return;
     setEditForm({
       title: detail.title,
@@ -229,7 +244,7 @@ export default function ItineraryPanel({
       end_date: detail.end_date,
     });
     setSharePath(detail.share_token ? sharedPagePath(detail.share_token) : "");
-  }, [detail]);
+  }, [detail?.id]);
 
   useEffect(() => {
     if (!initialPlace) return;
@@ -330,6 +345,24 @@ export default function ItineraryPanel({
     }, "여행 날짜를 삭제했습니다.");
   }
 
+  function beginDayEdit(day: ItineraryDay) {
+    setEditingDayId(day.id);
+    setDayEdit({ title: day.title, note: day.note });
+  }
+
+  async function saveDayEdit(event: FormEvent, day: ItineraryDay) {
+    event.preventDefault();
+    if (!detail) return;
+    await perform("edit-day-" + day.id, async () => {
+      await itineraryApi.updateItineraryDay(token, detail.id, day.id, {
+        title: dayEdit.title.trim(),
+        note: dayEdit.note.trim(),
+      });
+      setEditingDayId(null);
+      await refreshPlan(detail.id);
+    }, "날짜 제목과 메모를 저장했습니다.");
+  }
+
   function openItemForm(dayId: number) {
     setItemDayId(dayId);
     setPlaceQuery("");
@@ -405,6 +438,33 @@ export default function ItineraryPanel({
       await itineraryApi.deleteItineraryItem(token, detail.id, item.id);
       await refreshPlan(detail.id);
     }, "장소를 일정에서 삭제했습니다.");
+  }
+
+  function beginItemEdit(item: ItineraryItem) {
+    setEditingItemId(item.id);
+    setItemEdit({ start_time: item.start_time?.slice(0, 5) || "", end_time: item.end_time?.slice(0, 5) || "", note: item.note });
+  }
+
+  async function saveItemEdit(event: FormEvent, item: ItineraryItem) {
+    event.preventDefault();
+    if (!detail) return;
+    if (itemEdit.end_time && !itemEdit.start_time) {
+      setError("종료 시간을 입력하려면 시작 시간도 입력해 주세요.");
+      return;
+    }
+    if (itemEdit.start_time && itemEdit.end_time && itemEdit.end_time <= itemEdit.start_time) {
+      setError("종료 시간은 시작 시간보다 늦어야 합니다.");
+      return;
+    }
+    await perform("edit-item-" + item.id, async () => {
+      await itineraryApi.updateItineraryItem(token, detail.id, item.id, {
+        start_time: itemEdit.start_time || null,
+        end_time: itemEdit.end_time || null,
+        note: itemEdit.note.trim(),
+      });
+      setEditingItemId(null);
+      await refreshPlan(detail.id);
+    }, "장소 시간과 메모를 저장했습니다.");
   }
 
   async function inviteMember(event: FormEvent) {
@@ -554,7 +614,7 @@ export default function ItineraryPanel({
               </section>
 
               <section className="itinerary-days" aria-label="날짜별 여행 일정">
-                <header><div><span>DAILY ROUTE</span><h3>날짜별 일정</h3></div><small>{detail.days.length}/{planLength(detail)}일 구성됨</small></header>
+                <header><div><span>DAILY ROUTE</span><h3>날짜별 일정</h3></div><div className="itinerary-days__tools"><small>{detail.days.length}/{planLength(detail)}일 · 30초 자동 동기화</small><button type="button" disabled={Boolean(pending)} onClick={() => void perform("refresh-plan", () => refreshPlan(detail.id), "최신 공동 일정을 불러왔습니다.")}>↻ 지금 새로고침</button></div></header>
                 {!detail.days.length ? <div className="itinerary-days__empty"><span>＋</span><strong>아직 날짜가 비어 있어요.</strong><p>아래에서 여행 날짜를 먼저 추가해 주세요.</p></div> : null}
                 {detail.days.map((day, dayIndex) => {
                   const sortedItems = [...day.items].sort((left, right) => left.sort_order - right.sort_order || left.id - right.id);
@@ -562,8 +622,10 @@ export default function ItineraryPanel({
                     <article className="itinerary-day" key={day.id}>
                       <header>
                         <div><b>DAY {dayIndex + 1}</b><h4>{day.title || formatDate(day.calendar_date)}</h4><small>{formatDate(day.calendar_date, true)}</small></div>
-                        {detail.can_edit ? <button type="button" onClick={() => void removeDay(day.id, formatDate(day.calendar_date))} aria-label={formatDate(day.calendar_date) + " 일정 삭제"}>날짜 삭제</button> : null}
+                        {detail.can_edit ? <span className="itinerary-day__header-actions"><button type="button" onClick={() => beginDayEdit(day)}>제목·메모</button><button type="button" onClick={() => void removeDay(day.id, formatDate(day.calendar_date))} aria-label={formatDate(day.calendar_date) + " 일정 삭제"}>날짜 삭제</button></span> : null}
                       </header>
+                      {day.note && editingDayId !== day.id ? <p className="itinerary-day__note">{day.note}</p> : null}
+                      {detail.can_edit && editingDayId === day.id ? <form className="itinerary-day__edit" onSubmit={(event) => void saveDayEdit(event, day)}><label className="itinerary-field"><span>DAY 제목</span><input maxLength={180} value={dayEdit.title} onChange={(event) => setDayEdit({ ...dayEdit, title: event.target.value })} placeholder="예: 우붓 북부 천천히" /></label><label className="itinerary-field"><span>DAY 메모</span><textarea rows={2} maxLength={2000} value={dayEdit.note} onChange={(event) => setDayEdit({ ...dayEdit, note: event.target.value })} placeholder="이동, 준비물, 만날 장소" /></label><footer><button type="button" onClick={() => setEditingDayId(null)}>취소</button><button className="itinerary-primary" type="submit">저장</button></footer></form> : null}
                       <div className="itinerary-day__items">
                         {!sortedItems.length ? <p className="itinerary-day__empty">이 날짜에는 아직 장소가 없습니다.</p> : null}
                         {sortedItems.map((item, itemIndex) => (
@@ -577,9 +639,11 @@ export default function ItineraryPanel({
                                 </select>
                                 <button type="button" onClick={() => void reorderItem(item, -1)} disabled={itemIndex === 0 || Boolean(pending)} aria-label={`${item.place.title} 순서 위로`}>↑</button>
                                 <button type="button" onClick={() => void reorderItem(item, 1)} disabled={itemIndex === sortedItems.length - 1 || Boolean(pending)} aria-label={`${item.place.title} 순서 아래로`}>↓</button>
+                                <button type="button" onClick={() => beginItemEdit(item)} disabled={Boolean(pending)} aria-label={`${item.place.title} 시간과 메모 수정`}>✎</button>
                                 <button className="itinerary-item__remove" type="button" onClick={() => void removeItem(item)} disabled={Boolean(pending)} aria-label={`${item.place.title} 일정에서 삭제`}>×</button>
                               </div>
                             ) : null}
+                            {detail.can_edit && editingItemId === item.id ? <form className="itinerary-item__edit" onSubmit={(event) => void saveItemEdit(event, item)}><label><span>시작</span><input type="time" value={itemEdit.start_time} onChange={(event) => setItemEdit({ ...itemEdit, start_time: event.target.value })} /></label><label><span>종료</span><input type="time" value={itemEdit.end_time} onChange={(event) => setItemEdit({ ...itemEdit, end_time: event.target.value })} /></label><label><span>메모</span><input maxLength={2000} value={itemEdit.note} onChange={(event) => setItemEdit({ ...itemEdit, note: event.target.value })} /></label><footer><button type="button" onClick={() => setEditingItemId(null)}>취소</button><button className="itinerary-primary" type="submit">저장</button></footer></form> : null}
                           </div>
                         ))}
                       </div>

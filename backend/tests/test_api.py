@@ -54,6 +54,19 @@ def test_seeded_archipelago_and_health() -> None:
         assert {"Bali", "Nusa Penida", "Lombok", "Gili Trawangan"} <= islands
 
 
+def test_both_operating_accounts_have_the_same_admin_access() -> None:
+    with TestClient(app) as client:
+        for email in ("joohan92@naver.com", "tjwjd629@naver.com"):
+            login = client.post(
+                "/api/auth/login",
+                json={"email": email, "password": "admin-test-password"},
+            )
+            assert login.status_code == 200
+            headers = {"Authorization": "Bearer " + login.json()["access_token"]}
+            assert client.get("/api/auth/me", headers=headers).json()["is_admin"] is True
+            assert client.get("/api/admin/summary", headers=headers).status_code == 200
+
+
 def test_place_filters_favorites_and_trip() -> None:
     with TestClient(app) as client:
         headers = auth_headers(client)

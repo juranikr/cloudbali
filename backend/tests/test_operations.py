@@ -9,9 +9,11 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
+from app import image_storage
 from app.auth import get_admin_user, get_current_user, verify_password
 from app.config import settings
 from app.db import Base, get_db
+from app.extended_models import PlaceChangeEvent, PlaceImage
 from app.models import Place, Region, User
 from app.operations_api import record_place_change_event, router
 
@@ -101,6 +103,42 @@ def reset_database(monkeypatch: pytest.MonkeyPatch) -> Generator[None, None, Non
 
 def headers(user_id: int) -> dict[str, str]:
     return {"X-Test-User": str(user_id)}
+
+
+def _add_direct_upload_image(
+    db: Session,
+    *,
+    image_id: int,
+    key: str,
+    image_url: str,
+    bucket: str = "private-images",
+) -> PlaceImage:
+    row = PlaceImage(
+        id=image_id,
+        place_id=1,
+        user_id=3,
+        image_url=image_url,
+        caption="직접 업로드",
+    )
+    db.add(row)
+    db.flush()
+    record_place_change_event(
+        db,
+        place_id=1,
+        actor_id=3,
+        event_type="image_uploaded",
+        summary="직접 업로드한 장소 이미지 추가",
+        metadata={
+            "image_id": row.id,
+            "s3_key": key,
+            "s3_bucket": bucket,
+            "public_url": image_url,
+            "content_type": "image/webp",
+            "content_length": 100,
+        },
+    )
+    db.commit()
+    return row
 
 
 def test_admin_user_lifecycle_hashes_password_and_blocks_self_delete() -> None:
@@ -240,6 +278,95 @@ def test_notes_and_https_images_enforce_owner_or_admin_permissions() -> None:
         assert client.delete(f"/api/notes/{note_id}", headers=headers(3)).status_code == 204
 
 
+def test_direct_upload_delete_is_bucket_scoped_and_failure_safe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeS3:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, str]] = []
+            self.fail_keys: set[str] = set()
+
+        def delete_object(self, **kwargs) -> None:
+            self.calls.append(kwargs)
+            if kwargs["Key"] in self.fail_keys:
+                raise RuntimeError("simulated S3 failure")
+
+    fake = FakeS3()
+    monkeypatch.setattr(settings, "s3_bucket", "private-images")
+    monkeypatch.setattr(settings, "s3_public_base_url", "https://images.example.test")
+    monkeypatch.setattr(image_storage, "_s3_client", lambda: fake)
+
+    with TestClient(operations_test_app) as client:
+        success_key = "places/1/uploads/3/success.webp"
+        success_url = f"https://images.example.test/{success_key}"
+        with TestingSession() as db:
+            _add_direct_upload_image(
+                db,
+                image_id=101,
+                key=success_key,
+                image_url=success_url,
+            )
+        deleted = client.delete("/api/place-images/101", headers=headers(3))
+        assert deleted.status_code == 204
+        assert fake.calls == [{"Bucket": "private-images", "Key": success_key}]
+        with TestingSession() as db:
+            assert db.get(PlaceImage, 101) is None
+            deletion_event = db.query(PlaceChangeEvent).filter(
+                PlaceChangeEvent.event_type == "image_deleted"
+            ).order_by(PlaceChangeEvent.id.desc()).first()
+            assert f'"s3_key":"{success_key}"' in deletion_event.metadata_json
+            assert '"s3_object_deleted":true' in deletion_event.metadata_json
+
+        failed_key = "places/1/uploads/3/failure.webp"
+        failed_url = f"https://images.example.test/{failed_key}"
+        fake.fail_keys.add(failed_key)
+        with TestingSession() as db:
+            _add_direct_upload_image(
+                db,
+                image_id=102,
+                key=failed_key,
+                image_url=failed_url,
+            )
+        failed = client.delete("/api/place-images/102", headers=headers(3))
+        assert failed.status_code == 502
+        assert "기록을 보존" in failed.json()["detail"]
+        with TestingSession() as db:
+            assert db.get(PlaceImage, 102) is not None
+            assert db.query(PlaceChangeEvent).filter(
+                PlaceChangeEvent.event_type == "image_deleted",
+                PlaceChangeEvent.metadata_json.contains('"image_id":102'),
+            ).count() == 0
+
+        external_url = "https://external.example.test/photo.webp"
+        with TestingSession() as db:
+            db.add(PlaceImage(
+                id=103,
+                place_id=1,
+                user_id=3,
+                image_url=external_url,
+            ))
+            db.commit()
+        call_count = len(fake.calls)
+        assert client.delete("/api/place-images/103", headers=headers(3)).status_code == 204
+        assert len(fake.calls) == call_count
+        with TestingSession() as db:
+            assert db.get(PlaceImage, 103) is None
+
+        tampered_key = "places/1/uploads/3/tampered.webp"
+        with TestingSession() as db:
+            _add_direct_upload_image(
+                db,
+                image_id=104,
+                key=tampered_key,
+                image_url="https://images.example.test/wrong.webp",
+            )
+        call_count = len(fake.calls)
+        assert client.delete("/api/place-images/104", headers=headers(3)).status_code == 409
+        assert len(fake.calls) == call_count
+        with TestingSession() as db:
+            assert db.get(PlaceImage, 104) is not None
+
+
 def test_change_event_appeals_are_private_to_owner_and_admin_resolves_once() -> None:
     with TestClient(operations_test_app) as client:
         client.post(
@@ -325,3 +452,44 @@ def test_admin_rolls_back_validated_place_snapshot_only_once() -> None:
         assert client.post(
             f"/api/admin/place-events/{event_id}/rollback", headers=headers(1)
         ).status_code == 409
+
+
+def test_admin_must_undo_a_merge_before_rolling_back_the_hidden_source() -> None:
+    with TestingSession() as db:
+        place = db.get(Place, 1)
+        before = {"title": place.title}
+        place.title = "병합 전 수정된 장소명"
+        event = record_place_change_event(
+            db,
+            place_id=place.id,
+            actor_id=1,
+            event_type="place_updated",
+            summary="병합 전 장소명 수정",
+            field_name="title",
+            metadata={"before": before, "after": {"title": place.title}},
+        )
+        place.merged_into_id = 2
+        db.commit()
+        event_id = event.id
+
+    with TestClient(operations_test_app) as client:
+        blocked = client.post(
+            f"/api/admin/place-events/{event_id}/rollback", headers=headers(1)
+        )
+        assert blocked.status_code == 409
+        assert "병합을 먼저 취소" in blocked.json()["detail"]
+
+    with TestingSession() as db:
+        place = db.get(Place, 1)
+        assert place.title == "병합 전 수정된 장소명"
+        assert db.query(PlaceChangeEvent).filter(
+            PlaceChangeEvent.rollback_of_event_id == event_id
+        ).count() == 0
+        place.merged_into_id = None
+        db.commit()
+
+    with TestClient(operations_test_app) as client:
+        rolled_back = client.post(
+            f"/api/admin/place-events/{event_id}/rollback", headers=headers(1)
+        )
+        assert rolled_back.status_code == 200

@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import * as itineraryApi from "./itineraryApi";
+import { BRAND_KICKER, BRAND_NAME, BRAND_SEAL } from "./brand";
 import type { ItineraryDetail } from "./itineraryTypes";
 import "./itinerary.css";
 
@@ -45,7 +46,7 @@ function ErrorPage({ message }: { message: string }) {
       <span className="shared-itinerary-state__mark" aria-hidden="true">⌁</span>
       <strong>이 공유 일정을 열 수 없습니다.</strong>
       <p>{message}</p>
-      <a href="/">PATRA 지도로 돌아가기</a>
+      <a href="/">{BRAND_NAME} 지도로 돌아가기</a>
     </main>
   );
 }
@@ -86,7 +87,7 @@ export default function SharedItineraryPage({ shareToken }: { shareToken: string
     <main className="shared-itinerary-page">
       <header className="shared-itinerary-hero">
         <nav aria-label="공유 일정 탐색">
-          <a href="/" className="shared-itinerary-brand" aria-label="PATRA 여행 지도로 이동"><b>P</b><span><strong>PATRA</strong><small>ISLAND TRAVEL MAP</small></span></a>
+          <a href="/" className="shared-itinerary-brand" aria-label={`${BRAND_NAME} 여행 지도로 이동`}><b>{BRAND_SEAL}</b><span><strong>{BRAND_NAME}</strong><small>{BRAND_KICKER}</small></span></a>
           <span>읽기 전용 공유 일정</span>
         </nav>
         <div className="shared-itinerary-hero__content">
@@ -144,7 +145,7 @@ export default function SharedItineraryPage({ shareToken }: { shareToken: string
       </section>
 
       <footer className="shared-itinerary-footer">
-        <div><strong>PATRA</strong><span>발리 · 누사 페니다 · 롬복 · 길리</span></div>
+        <div><strong>{BRAND_NAME}</strong><span>발리 · 누사 페니다 · 롬복 · 길리</span></div>
         <p>장소의 운영시간, 날씨, 배편은 출발 전에 다시 확인해 주세요. 공유 링크는 소유자가 언제든 폐기할 수 있습니다.</p>
         <a href="/">내 여행 지도 열기 →</a>
       </footer>

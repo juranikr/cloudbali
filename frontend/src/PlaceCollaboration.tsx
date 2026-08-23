@@ -7,12 +7,16 @@ import type {
   PlaceChangeEvent,
   PlaceImage,
   PlaceImageDraft,
+  PlaceChain,
+  PlaceContributor,
+  PlaceInsight,
+  PlaceInsightDraft,
   PlaceNote,
 } from "./placeCollaborationTypes";
 import "./placeCollaboration.css";
 
 
-type CollaborationTab = "notes" | "images" | "history" | "appeals";
+type CollaborationTab = "info" | "notes" | "images" | "history" | "appeals";
 
 export type PlaceCollaborationProps = {
   token: string;
@@ -20,6 +24,8 @@ export type PlaceCollaborationProps = {
   currentUserId: number;
   isAdmin: boolean;
   placeTitle?: string;
+  chainId?: number | null;
+  branchName?: string;
   className?: string;
   onClose?: () => void;
   onChanged?: () => void;
@@ -28,6 +34,7 @@ export type PlaceCollaborationProps = {
 
 const EMPTY_IMAGE: PlaceImageDraft = { image_url: "", caption: "", source_url: "" };
 const EMPTY_APPEAL: AppealDraft = { event_id: 0, reason: "", detail: "" };
+const EMPTY_INSIGHT: PlaceInsightDraft = { kind: "tip", title: "", content: "", year_label: "", source_url: "", source_title: "", confidence: .7 };
 
 const DATE_TIME = new Intl.DateTimeFormat("ko-KR", {
   month: "short",
@@ -81,27 +88,40 @@ export default function PlaceCollaboration({
   currentUserId,
   isAdmin,
   placeTitle,
+  chainId = null,
+  branchName = "",
   className,
   onClose,
   onChanged,
 }: PlaceCollaborationProps) {
-  const [tab, setTab] = useState<CollaborationTab>("notes");
+  const [tab, setTab] = useState<CollaborationTab>("info");
   const [notes, setNotes] = useState<PlaceNote[]>([]);
   const [images, setImages] = useState<PlaceImage[]>([]);
   const [events, setEvents] = useState<PlaceChangeEvent[]>([]);
   const [appeals, setAppeals] = useState<PlaceAppeal[]>([]);
+  const [contributors, setContributors] = useState<PlaceContributor[]>([]);
+  const [insights, setInsights] = useState<PlaceInsight[]>([]);
+  const [chains, setChains] = useState<PlaceChain[]>([]);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [noteContent, setNoteContent] = useState("");
+  const [noteVisibility, setNoteVisibility] = useState<"shared" | "private">("shared");
   const [editingNoteId, setEditingNoteId] = useState<number | null>(null);
   const [editingNoteContent, setEditingNoteContent] = useState("");
+  const [editingNoteVisibility, setEditingNoteVisibility] = useState<"shared" | "private">("shared");
   const [imageDraft, setImageDraft] = useState<PlaceImageDraft>(EMPTY_IMAGE);
+  const [uploadFile, setUploadFile] = useState<File | null>(null);
+  const [uploadCaption, setUploadCaption] = useState("");
   const [editingImageId, setEditingImageId] = useState<number | null>(null);
   const [editingImageDraft, setEditingImageDraft] = useState<PlaceImageDraft>(EMPTY_IMAGE);
   const [brokenImageIds, setBrokenImageIds] = useState<Set<number>>(new Set());
   const [appealDraft, setAppealDraft] = useState<AppealDraft>(EMPTY_APPEAL);
+  const [contributorEmail, setContributorEmail] = useState("");
+  const [insightDraft, setInsightDraft] = useState<PlaceInsightDraft>(EMPTY_INSIGHT);
+  const [selectedChainId, setSelectedChainId] = useState<number>(chainId || 0);
+  const [chainBranchName, setChainBranchName] = useState(branchName);
   const loadVersion = useRef(0);
 
   const appealsByEvent = useMemo(
@@ -125,18 +145,27 @@ export default function PlaceCollaboration({
       collaborationApi.listPlaceImages(token, placeId),
       collaborationApi.listPlaceChangeEvents(token, placeId),
       collaborationApi.listMyPlaceAppeals(token),
+      collaborationApi.listPlaceContributors(token, placeId),
+      collaborationApi.listPlaceInsights(token, placeId),
+      collaborationApi.listChains(token),
     ]);
     if (version !== loadVersion.current) return;
-    const [notesResult, imagesResult, eventsResult, appealsResult] = results;
+    const [notesResult, imagesResult, eventsResult, appealsResult, contributorsResult, insightsResult, chainsResult] = results;
     if (notesResult.status === "fulfilled") setNotes(notesResult.value);
     if (imagesResult.status === "fulfilled") setImages(sortImages(imagesResult.value));
     if (eventsResult.status === "fulfilled") setEvents(eventsResult.value);
     if (appealsResult.status === "fulfilled") setAppeals(appealsResult.value);
+    if (contributorsResult.status === "fulfilled") setContributors(contributorsResult.value);
+    if (insightsResult.status === "fulfilled") setInsights(insightsResult.value);
+    if (chainsResult.status === "fulfilled") setChains(chainsResult.value);
     const failedLabels = [
       notesResult.status === "rejected" ? "메모" : "",
       imagesResult.status === "rejected" ? "이미지" : "",
       eventsResult.status === "rejected" ? "변경 이력" : "",
       appealsResult.status === "rejected" ? "이의신청" : "",
+      contributorsResult.status === "rejected" ? "공동 편집자" : "",
+      insightsResult.status === "rejected" ? "출처 인사이트" : "",
+      chainsResult.status === "rejected" ? "체인" : "",
     ].filter(Boolean);
     if (failedLabels.length) setError(failedLabels.join("·") + " 정보를 불러오지 못했습니다.");
     setLoading(false);
@@ -148,11 +177,19 @@ export default function PlaceCollaboration({
     setEvents([]);
     setAppeals([]);
     setNoteContent("");
+    setNoteVisibility("shared");
     setEditingNoteId(null);
     setImageDraft(EMPTY_IMAGE);
     setEditingImageId(null);
     setBrokenImageIds(new Set());
     setAppealDraft(EMPTY_APPEAL);
+    setContributors([]);
+    setInsights([]);
+    setChains([]);
+    setContributorEmail("");
+    setInsightDraft(EMPTY_INSIGHT);
+    setSelectedChainId(chainId || 0);
+    setChainBranchName(branchName);
     setNotice("");
     void loadAll();
     return () => {
@@ -176,9 +213,10 @@ export default function PlaceCollaboration({
     setError("");
     setNotice("");
     try {
-      const created = await collaborationApi.createPlaceNote(token, placeId, content);
+      const created = await collaborationApi.createPlaceNote(token, placeId, content, noteVisibility);
       setNotes((current) => [...current, created]);
       setNoteContent("");
+      setNoteVisibility("shared");
       setNotice("여행자 메모를 추가했습니다.");
       await refreshEvents();
       onChanged?.();
@@ -192,6 +230,7 @@ export default function PlaceCollaboration({
   function beginNoteEdit(note: PlaceNote) {
     setEditingNoteId(note.id);
     setEditingNoteContent(note.content);
+    setEditingNoteVisibility(note.visibility);
     setError("");
     setNotice("");
   }
@@ -203,7 +242,7 @@ export default function PlaceCollaboration({
     setBusy("note-" + note.id);
     setError("");
     try {
-      const updated = await collaborationApi.updatePlaceNote(token, note.id, content);
+      const updated = await collaborationApi.updatePlaceNote(token, note.id, content, editingNoteVisibility);
       setNotes((current) => current.map((item) => item.id === updated.id ? updated : item));
       setEditingNoteId(null);
       setEditingNoteContent("");
@@ -364,6 +403,138 @@ export default function PlaceCollaboration({
     }
   }
 
+  async function uploadLocalImage(event: FormEvent) {
+    event.preventDefault();
+    if (!uploadFile || busy) return;
+    setBusy("image-upload");
+    setError("");
+    try {
+      await collaborationApi.uploadPlaceImage(token, placeId, uploadFile, uploadCaption.trim());
+      setImages(sortImages(await collaborationApi.listPlaceImages(token, placeId)));
+      setUploadFile(null);
+      setUploadCaption("");
+      setNotice("기기에서 선택한 사진을 업로드했습니다.");
+      await refreshEvents();
+      onChanged?.();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "사진을 업로드하지 못했습니다.");
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function inviteContributor(event: FormEvent) {
+    event.preventDefault();
+    if (!contributorEmail.trim() || busy) return;
+    setBusy("contributor-add");
+    setError("");
+    try {
+      const created = await collaborationApi.invitePlaceContributor(token, placeId, contributorEmail.trim());
+      setContributors((current) => [...current, created]);
+      setContributorEmail("");
+      setNotice("공동 편집자를 초대했습니다.");
+      await refreshEvents();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "공동 편집자를 초대하지 못했습니다.");
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function removeContributor(item: PlaceContributor) {
+    if (item.role === "owner" || !window.confirm(`${item.display_name}님의 편집 권한을 해제할까요?`)) return;
+    setBusy("contributor-" + item.user_id);
+    try {
+      await collaborationApi.removePlaceContributor(token, placeId, item.user_id);
+      setContributors((current) => current.filter((row) => row.user_id !== item.user_id));
+      setNotice("공동 편집 권한을 해제했습니다.");
+      await refreshEvents();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "편집 권한을 해제하지 못했습니다.");
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function addInsight(event: FormEvent) {
+    event.preventDefault();
+    if (!insightDraft.title.trim() || !insightDraft.content.trim() || !insightDraft.source_url.trim() || busy) return;
+    setBusy("insight-add");
+    setError("");
+    try {
+      const created = await collaborationApi.createPlaceInsight(token, placeId, {
+        ...insightDraft,
+        title: insightDraft.title.trim(),
+        content: insightDraft.content.trim(),
+        source_url: insightDraft.source_url.trim(),
+        source_title: insightDraft.source_title.trim(),
+        year_label: insightDraft.year_label.trim(),
+      });
+      setInsights((current) => [...current, created]);
+      setInsightDraft(EMPTY_INSIGHT);
+      setNotice("출처가 있는 장소 인사이트를 추가했습니다.");
+      await refreshEvents();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "인사이트를 추가하지 못했습니다.");
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function editInsight(item: PlaceInsight) {
+    const title = window.prompt("인사이트 제목", item.title);
+    if (title === null || !title.trim()) return;
+    const content = window.prompt("인사이트 내용", item.content);
+    if (content === null || !content.trim()) return;
+    setBusy("insight-" + item.id);
+    try {
+      const updated = await collaborationApi.updatePlaceInsight(token, item.id, { title: title.trim(), content: content.trim() });
+      setInsights((current) => current.map((row) => row.id === updated.id ? updated : row));
+      setNotice("인사이트를 수정했습니다.");
+      await refreshEvents();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "인사이트를 수정하지 못했습니다.");
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function removeInsight(item: PlaceInsight) {
+    if (!window.confirm(`‘${item.title}’ 인사이트를 삭제할까요?`)) return;
+    setBusy("insight-" + item.id);
+    try {
+      await collaborationApi.deletePlaceInsight(token, item.id);
+      setInsights((current) => current.filter((row) => row.id !== item.id));
+      setNotice("인사이트를 삭제했습니다.");
+      await refreshEvents();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "인사이트를 삭제하지 못했습니다.");
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function saveChain(event: FormEvent) {
+    event.preventDefault();
+    setBusy("chain");
+    setError("");
+    try {
+      if (selectedChainId) {
+        await collaborationApi.assignPlaceChain(token, placeId, selectedChainId, chainBranchName.trim());
+        setNotice("체인과 지점 정보를 연결했습니다.");
+      } else {
+        await collaborationApi.unassignPlaceChain(token, placeId);
+        setNotice("체인 연결을 해제했습니다.");
+      }
+      await refreshEvents();
+      onChanged?.();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "체인 정보를 저장하지 못했습니다.");
+    } finally {
+      setBusy("");
+    }
+  }
+
   const rootClass = ["place-collab", className].filter(Boolean).join(" ");
 
   return (
@@ -383,6 +554,7 @@ export default function PlaceCollaboration({
 
       <nav className="place-collab__tabs" role="tablist" aria-label="장소 협업 메뉴">
         {([
+          ["info", "근거·편집", insights.length + contributors.length],
           ["notes", "메모", notes.length],
           ["images", "사진", images.length],
           ["history", "변경 이력", events.length],
@@ -407,12 +579,40 @@ export default function PlaceCollaboration({
       {notice ? <p className="place-collab__alert place-collab__alert--notice" role="status">{notice}</p> : null}
       {loading ? <div className="place-collab__loading" role="status"><i />협업 정보를 불러오는 중…</div> : null}
 
+      {!loading && tab === "info" ? (
+        <div className="place-collab__panel place-collab__info" id={`place-collab-panel-${placeId}-info`} role="tabpanel" aria-labelledby={`place-collab-tab-${placeId}-info`}>
+          <section>
+            <header className="place-collab__section-head"><div><strong>출처가 있는 여행 정보</strong><p>위치·역사·방문 팁마다 확인 가능한 원문을 함께 남깁니다.</p></div><small>{insights.length}건</small></header>
+            <form className="place-collab__insight-form" onSubmit={(event) => void addInsight(event)}>
+              <select value={insightDraft.kind} onChange={(event) => setInsightDraft({ ...insightDraft, kind: event.target.value as PlaceInsight["kind"] })}><option value="location">위치</option><option value="history">역사</option><option value="visit">방문</option><option value="tip">팁</option></select>
+              <input required maxLength={200} value={insightDraft.title} onChange={(event) => setInsightDraft({ ...insightDraft, title: event.target.value })} placeholder="정보 제목" />
+              <textarea required rows={3} maxLength={5000} value={insightDraft.content} onChange={(event) => setInsightDraft({ ...insightDraft, content: event.target.value })} placeholder="여행자가 이해하기 쉬운 내용" />
+              <input required type="url" pattern="https://.*" maxLength={2000} value={insightDraft.source_url} onChange={(event) => setInsightDraft({ ...insightDraft, source_url: event.target.value })} placeholder="https:// 공식·신뢰할 수 있는 출처" />
+              <div><input maxLength={300} value={insightDraft.source_title} onChange={(event) => setInsightDraft({ ...insightDraft, source_title: event.target.value })} placeholder="출처 이름" /><button type="submit" disabled={Boolean(busy)}>근거 추가</button></div>
+            </form>
+            <div className="place-collab__insights">
+              {insights.map((item) => <article key={item.id}><header><span>{item.kind}{item.verified_at ? <b>확인됨</b> : null}</span><small>신뢰 {Math.round(item.confidence * 100)}%</small></header><strong>{item.year_label ? item.year_label + " · " : ""}{item.title}</strong><p>{item.content}</p><footer><a href={item.source_url} target="_blank" rel="noreferrer">{item.source_title || "근거 원문"} ↗</a>{item.can_edit ? <span><button type="button" onClick={() => void editInsight(item)}>수정</button><button type="button" className="danger" onClick={() => void removeInsight(item)}>삭제</button></span> : null}</footer></article>)}
+              {!insights.length ? <p className="place-collab__hint">아직 출처 인사이트가 없습니다.</p> : null}
+            </div>
+          </section>
+          <section>
+            <header className="place-collab__section-head"><div><strong>공동 편집자</strong><p>계정 이메일로 장소 정보를 함께 관리할 사람을 초대합니다.</p></div><small>{contributors.length}명</small></header>
+            <form className="place-collab__inline-form" onSubmit={(event) => void inviteContributor(event)}><input type="email" required value={contributorEmail} onChange={(event) => setContributorEmail(event.target.value)} placeholder="editor@example.com" /><button type="submit" disabled={Boolean(busy)}>초대</button></form>
+            <div className="place-collab__contributors">{contributors.map((item) => <article key={item.user_id}><span><strong>{item.display_name}</strong><small>{item.email} · {item.role === "owner" ? "소유자" : "편집자"}</small></span>{item.role !== "owner" ? <button type="button" onClick={() => void removeContributor(item)} disabled={Boolean(busy)}>해제</button> : null}</article>)}</div>
+          </section>
+          <section>
+            <header className="place-collab__section-head"><div><strong>체인·브랜드 지점</strong><p>같은 체인의 다른 지점을 묶어 찾기 쉽게 만듭니다.</p></div></header>
+            <form className="place-collab__chain-form" onSubmit={(event) => void saveChain(event)}><select value={selectedChainId} onChange={(event) => setSelectedChainId(Number(event.target.value))}><option value={0}>체인 연결 없음</option>{chains.map((chain) => <option key={chain.id} value={chain.id}>{chain.name_ko || chain.name_local} · {chain.branch_count}개 지점</option>)}</select><input maxLength={120} value={chainBranchName} onChange={(event) => setChainBranchName(event.target.value)} placeholder="지점명 (예: 우붓점)" /><button type="submit" disabled={Boolean(busy)}>저장</button></form>
+          </section>
+        </div>
+      ) : null}
+
       {!loading && tab === "notes" ? (
         <div className="place-collab__panel" id={`place-collab-panel-${placeId}-notes`} role="tabpanel" aria-labelledby={`place-collab-tab-${placeId}-notes`}>
           <form className="place-collab__composer" onSubmit={(event) => void addNote(event)}>
             <label htmlFor={`place-note-${placeId}`}>이 장소에 남길 여행자 메모</label>
             <textarea id={`place-note-${placeId}`} rows={3} maxLength={5000} value={noteContent} onChange={(event) => setNoteContent(event.target.value)} placeholder="방문 시간, 접근 방법처럼 다른 여행자에게 유용한 내용을 남겨주세요." />
-            <div><small>{noteContent.length.toLocaleString()} / 5,000</small><button type="submit" disabled={!noteContent.trim() || Boolean(busy)}>메모 추가</button></div>
+            <div><select aria-label="메모 공개 범위" value={noteVisibility} onChange={(event) => setNoteVisibility(event.target.value as "shared" | "private")}><option value="shared">여행자와 공유</option><option value="private">나만 보기</option></select><small>{noteContent.length.toLocaleString()} / 5,000</small><button type="submit" disabled={!noteContent.trim() || Boolean(busy)}>메모 추가</button></div>
           </form>
           {!notes.length ? <div className="place-collab__empty"><span>✎</span><strong>아직 메모가 없습니다.</strong><p>직접 확인한 최신 여행 정보를 첫 메모로 남겨보세요.</p></div> : null}
           <div className="place-collab__notes">
@@ -423,9 +623,9 @@ export default function PlaceCollaboration({
                   <form onSubmit={(event) => void saveNote(event, note)}>
                     <label className="sr-only" htmlFor={`edit-note-${note.id}`}>메모 내용 수정</label>
                     <textarea id={`edit-note-${note.id}`} rows={4} maxLength={5000} value={editingNoteContent} onChange={(event) => setEditingNoteContent(event.target.value)} autoFocus />
-                    <div><button type="button" onClick={() => setEditingNoteId(null)}>취소</button><button type="submit" disabled={!editingNoteContent.trim() || Boolean(busy)}>저장</button></div>
+                    <div><select aria-label="메모 공개 범위" value={editingNoteVisibility} onChange={(event) => setEditingNoteVisibility(event.target.value as "shared" | "private")}><option value="shared">여행자와 공유</option><option value="private">나만 보기</option></select><button type="button" onClick={() => setEditingNoteId(null)}>취소</button><button type="submit" disabled={!editingNoteContent.trim() || Boolean(busy)}>저장</button></div>
                   </form>
-                ) : <p>{note.content}</p>}
+                ) : <p>{note.content}<small className="place-collab__visibility">{note.visibility === "private" ? "나만 보기" : "공유 메모"}</small></p>}
                 {note.can_edit && editingNoteId !== note.id ? <footer><button type="button" onClick={() => beginNoteEdit(note)}>수정</button><button type="button" className="danger" onClick={() => void removeNote(note)} disabled={Boolean(busy)}>삭제</button></footer> : null}
               </article>
             ))}
@@ -435,6 +635,11 @@ export default function PlaceCollaboration({
 
       {!loading && tab === "images" ? (
         <div className="place-collab__panel" id={`place-collab-panel-${placeId}-images`} role="tabpanel" aria-labelledby={`place-collab-tab-${placeId}-images`}>
+          <form className="place-collab__local-upload" onSubmit={(event) => void uploadLocalImage(event)}>
+            <label><strong>내 기기에서 사진 올리기</strong><small>JPEG·PNG·WebP, 서버 설정 범위 내 용량</small><input type="file" accept="image/jpeg,image/png,image/webp" onChange={(event) => setUploadFile(event.target.files?.[0] || null)} /></label>
+            <input maxLength={300} value={uploadCaption} onChange={(event) => setUploadCaption(event.target.value)} placeholder="사진 설명 (선택)" />
+            <button type="submit" disabled={!uploadFile || Boolean(busy)}>{busy === "image-upload" ? "업로드 중…" : "직접 업로드"}</button>
+          </form>
           <details className="place-collab__image-add">
             <summary>HTTPS 이미지 URL 추가</summary>
             <form onSubmit={(event) => void addImage(event)}>

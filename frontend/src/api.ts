@@ -1,4 +1,4 @@
-import type { AdminSummary, AdminUser, BatchRun, ChatMessage, ChatResponse, DiscoveryCandidate, DiscoveryRunResult, Place, PlaceAppeal, PlaceChangeEvent, Region, RegionSnapshot, SearchHit, TokenResponse, TripStop, User } from "./types";
+import type { AdminSummary, AdminUser, AgentProposal, AgentRun, AgentRunStep, BatchRun, ChatMessage, ChatResponse, DiscoveryCandidate, DiscoveryRunResult, Place, PlaceAppeal, PlaceChangeEvent, Region, RegionSnapshot, SearchHit, TokenResponse, TravelProfile, TripStop, User, UserMessage } from "./types";
 
 const API_BASE = import.meta.env.VITE_API_URL || "";
 
@@ -98,10 +98,25 @@ export function createPlace(
     lat: number;
     lng: number;
     tags?: string[];
+    source_url?: string;
     coordinate_source?: string;
+    coordinate_external_id?: string;
+    coordinate_confidence?: number | null;
   }
 ): Promise<Place> {
   return request("/api/places", token, { method: "POST", body: JSON.stringify(body) });
+}
+
+export function updatePlace(
+  token: string,
+  placeId: number,
+  body: Partial<Pick<Place, "category" | "title" | "description" | "duration_minutes" | "budget_level" | "best_time" | "access_type" | "booking_required" | "weather_sensitive" | "tide_sensitive" | "ferry_sensitive" | "traveler_note" | "tags">>,
+): Promise<Place> {
+  return request("/api/places/" + placeId, token, { method: "PATCH", body: JSON.stringify(body) });
+}
+
+export function deletePlace(token: string, placeId: number): Promise<void> {
+  return request("/api/places/" + placeId, token, { method: "DELETE" });
 }
 
 export function trip(token: string): Promise<TripStop[]> {
@@ -260,4 +275,68 @@ export function adminResolveAppeal(
 
 export function adminRollbackPlaceEvent(token: string, eventId: number): Promise<PlaceChangeEvent> {
   return request("/api/admin/place-events/" + eventId + "/rollback", token, { method: "POST" });
+}
+
+export function messages(token: string, unreadOnly = false): Promise<UserMessage[]> {
+  const query = new URLSearchParams({ limit: "100" });
+  if (unreadOnly) query.set("unread_only", "true");
+  return request("/api/messages?" + query.toString(), token);
+}
+
+export function unreadMessageCount(token: string): Promise<{ count: number }> {
+  return request("/api/messages/unread-count", token);
+}
+
+export function markMessageRead(token: string, messageId: number): Promise<UserMessage> {
+  return request("/api/messages/" + messageId + "/read", token, { method: "POST" });
+}
+
+export function markAllMessagesRead(token: string): Promise<{ updated: number }> {
+  return request("/api/messages/read-all", token, { method: "POST" });
+}
+
+export function travelProfile(token: string, regionId?: number): Promise<TravelProfile> {
+  const query = new URLSearchParams();
+  if (regionId) query.set("region_id", String(regionId));
+  return request("/api/travel-profile" + (query.size ? "?" + query.toString() : ""), token);
+}
+
+export function adminAgentRuns(token: string, limit = 30): Promise<AgentRun[]> {
+  return request("/api/admin/agent/runs?limit=" + limit, token);
+}
+
+export function adminAgentRun(token: string, runId: number): Promise<AgentRun> {
+  return request("/api/admin/agent/runs/" + runId, token);
+}
+
+export function adminAgentRunSteps(token: string, runId: number): Promise<AgentRunStep[]> {
+  return request("/api/admin/agent/runs/" + runId + "/steps", token);
+}
+
+export function adminRunAgent(
+  token: string,
+  body: { region_id?: number | null; mode: AgentRun["mode"] },
+): Promise<AgentRun> {
+  return request("/api/admin/agent/run", token, { method: "POST", body: JSON.stringify(body) });
+}
+
+export function adminAgentProposals(
+  token: string,
+  options: { status?: string; regionId?: number } = {},
+): Promise<AgentProposal[]> {
+  const query = new URLSearchParams({ status: options.status || "pending" });
+  if (options.regionId) query.set("region_id", String(options.regionId));
+  return request("/api/admin/agent/proposals?" + query.toString(), token);
+}
+
+export function adminDecideAgentProposal(
+  token: string,
+  proposalId: number,
+  decision: "approve" | "reject",
+  body: { note?: string; force?: boolean } = {},
+): Promise<AgentProposal> {
+  return request("/api/admin/agent/proposals/" + proposalId + "/" + decision, token, {
+    method: "POST",
+    body: JSON.stringify(decision === "approve" ? { note: body.note || "", force: Boolean(body.force) } : { note: body.note || "" }),
+  });
 }

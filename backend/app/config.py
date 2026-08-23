@@ -10,6 +10,7 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     app_name: str = "PATRA"
+    aws_region: str = "ap-northeast-2"
     database_url: str = _DEFAULT_DB
     jwt_secret: str = "change-this-before-production-patra"
     jwt_algorithm: str = "HS256"
@@ -18,15 +19,26 @@ class Settings(BaseSettings):
         "http://localhost:5173,http://127.0.0.1:5173,"
         "http://localhost:18000,http://127.0.0.1:18000"
     )
-    geocoder_user_agent: str = "patra-local-development/0.1"
+    geocoder_user_agent: str = (
+        "PATRA-Bali-place-search/1.0 (https://github.com/juranikr/cloudbali)"
+    )
     geocoder_timeout_seconds: float = 6.0
-    admin_emails: str = "joohan92@naver.com"
+    admin_emails: str = "joohan92@naver.com,tjwjd629@naver.com"
     seed_test_account: bool = True
     groq_api_key: str = ""
     groq_chat_model: str = "openai/gpt-oss-120b"
     # Stay comfortably below CloudFront's 30-second origin timeout so a
     # completed answer is never stored after the client already saw a 504.
     groq_timeout_seconds: float = 24.0
+    # Optional production integrations. Local development deliberately leaves
+    # these blank so storage and durable workflow dispatch fail closed.
+    s3_bucket: str = ""
+    s3_public_base_url: str = ""
+    image_upload_max_bytes: int = 10 * 1024 * 1024
+    image_presign_expire_seconds: int = 10 * 60
+    discovery_state_machine_arn: str = ""
+    discovery_worker_mode: str = "candidate_discovery"
+    curation_state_machine_arn: str = ""
 
     @property
     def cors_origin_list(self) -> list[str]:

@@ -392,6 +392,18 @@ def _item_for_plan(db: Session, plan_id: int, item_id: int) -> TravelPlanItem:
     return item
 
 
+def _lock_active_places(db: Session, place_ids: set[int]) -> dict[int, Place]:
+    ids = sorted(place_ids)
+    rows = db.query(Place).filter(
+        Place.id.in_(ids),
+        Place.merged_into_id.is_(None),
+    ).order_by(Place.id).populate_existing().with_for_update().all()
+    by_id = {row.id: row for row in rows}
+    if len(by_id) != len(ids):
+        raise HTTPException(status_code=404, detail="장소를 찾을 수 없거나 이미 다른 장소에 병합되었습니다")
+    return by_id
+
+
 def _commit_unique(db: Session, detail: str) -> None:
     try:
         db.commit()
@@ -576,9 +588,7 @@ def create_itinerary_item(
 ) -> TravelPlanItemOut:
     plan, _ = _require_plan(db, plan_id, user, edit=True)
     day = _day_for_plan(db, plan.id, day_id)
-    place = db.get(Place, body.place_id)
-    if place is None:
-        raise HTTPException(status_code=404, detail="장소를 찾을 수 없습니다")
+    _lock_active_places(db, {body.place_id})
     values = body.model_dump()
     if values["sort_order"] is None:
         values["sort_order"] = (
@@ -604,8 +614,15 @@ def update_itinerary_item(
     values = body.model_dump(exclude_unset=True)
     if "day_id" in values:
         _day_for_plan(db, plan.id, values["day_id"])
-    if "place_id" in values and db.get(Place, values["place_id"]) is None:
-        raise HTTPException(status_code=404, detail="장소를 찾을 수 없습니다")
+    place_ids = {item.place_id}
+    if "place_id" in values:
+        place_ids.add(values["place_id"])
+    _lock_active_places(db, place_ids)
+    item = db.query(TravelPlanItem).filter(
+        TravelPlanItem.id == item.id,
+    ).populate_existing().with_for_update().first()
+    if item is None or item.place_id not in place_ids:
+        raise HTTPException(status_code=409, detail="장소 병합으로 일정 항목이 변경되었습니다. 새로고침 후 다시 시도해 주세요")
     next_start = values.get("start_time", item.start_time)
     next_end = values.get("end_time", item.end_time)
     try:

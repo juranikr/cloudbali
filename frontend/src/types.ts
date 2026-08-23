@@ -48,7 +48,13 @@ export type Place = {
   tags: string[];
   source_url: string;
   coordinate_source: string;
+  coordinate_external_id: string;
+  coordinate_confidence: number | null;
+  coordinate_verified_at: string | null;
   coordinate_crs: string;
+  chain_id: number | null;
+  branch_name: string;
+  merged_into_id: number | null;
   is_favorite: boolean;
   is_seed: boolean;
   created_at: string;
@@ -64,6 +70,18 @@ export type SearchHit = {
   region_id: number | null;
   place_id: number | null;
   category: string;
+  source_url: string;
+  source_urls: string[];
+  external_id: string;
+  external_ids: Record<string, string>;
+  coordinate_source: string;
+  confidence: number;
+  cross_checked: boolean;
+  storage_allowed: boolean;
+  attribution: string;
+  license: string;
+  license_url: string;
+  sources: string[];
 };
 
 export type TripStop = {
@@ -111,12 +129,36 @@ export type ChatMessage = {
   content: string;
   model: string;
   place_ids: number[];
+  sources: string[];
+  candidates: ChatCandidate[];
   created_at: string;
+};
+
+export type ChatCandidate = {
+  key: string;
+  title: string;
+  display_name: string;
+  region_id: number | null;
+  category: string;
+  status: string;
+  source: string;
+  source_urls: string[];
+  external_id: string;
+  lat: number | null;
+  lng: number | null;
+  confidence: number;
+  cross_checked: boolean;
+  storage_allowed: boolean;
+  license: string;
+  attribution: string;
+  proposal_id: number | null;
 };
 
 export type ChatResponse = {
   message: ChatMessage;
   grounded_places: Place[];
+  model: string;
+  work_state: Record<string, unknown>;
 };
 
 export type RegionSnapshot = {
@@ -205,4 +247,98 @@ export type PlaceAppeal = {
   resolved_at: string | null;
   created_at: string;
   updated_at: string;
+};
+
+export type UserMessage = {
+  id: number;
+  place_id: number | null;
+  related_event_id: number | null;
+  kind: string;
+  title: string;
+  body: string;
+  read_at: string | null;
+  created_at: string;
+};
+
+export type TravelSignal = {
+  key: string;
+  label: string;
+  score: number;
+  evidence_count: number;
+};
+
+export type TravelAnchor = {
+  place_id: number;
+  title: string;
+  region: string;
+  lat: number;
+  lng: number;
+  sources: string[];
+};
+
+export type TravelRecommendation = {
+  place_id: number;
+  title: string;
+  category: string;
+  region: string;
+  score: number;
+  reason: string;
+  distance_km: number | null;
+};
+
+export type TravelProfile = {
+  user_id: number;
+  region_id: number | null;
+  signals: TravelSignal[];
+  anchors: TravelAnchor[];
+  recommendations: TravelRecommendation[];
+  category_scores: Record<string, number>;
+  region_scores: Record<string, number>;
+  evidence: Record<string, number>;
+};
+
+export type AgentRun = {
+  id: number;
+  region_id: number | null;
+  mode: "full" | "discovery" | "quality" | "verification";
+  trigger: string;
+  status: "queued" | "running" | "success" | "partial" | "failed";
+  objective: string;
+  score: number | null;
+  metrics: Record<string, unknown>;
+  summary: string;
+  started_at: string;
+  finished_at: string | null;
+};
+
+export type AgentRunStep = {
+  id: number;
+  sequence: number;
+  phase: string;
+  tool: string;
+  outcome: string;
+  score_delta: number;
+  detail: string;
+  metadata: Record<string, unknown>;
+  created_at: string;
+};
+
+export type AgentProposal = {
+  id: number;
+  region_id: number | null;
+  run_id: number | null;
+  place_id: number | null;
+  secondary_place_id: number | null;
+  result_place_id: number | null;
+  discovery_candidate_id: number | null;
+  action: string;
+  title: string;
+  payload: Record<string, unknown>;
+  evidence: string;
+  source_urls: string[];
+  confidence: number;
+  status: string;
+  decision_note: string;
+  created_at: string;
+  decided_at: string | null;
 };

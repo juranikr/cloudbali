@@ -7,19 +7,44 @@ on:
     paths:
       - "backend/**"
       - "frontend/**"
+      - "infra/**"
+      - "Dockerfile"
+      - ".dockerignore"
+      - ".github/workflows/deploy.yml"
+  pull_request:
+    paths:
+      - "backend/**"
+      - "frontend/**"
+      - "infra/**"
       - "Dockerfile"
       - ".dockerignore"
       - ".github/workflows/deploy.yml"
 
 permissions:
-  id-token: write
   contents: read
+  pull-requests: read
 
 env:
   AWS_REGION: ap-northeast-2
 
 jobs:
-  test:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      app: ${{ steps.filter.outputs.app }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            app:
+              - 'backend/**'
+              - 'frontend/**'
+              - 'Dockerfile'
+              - '.dockerignore'
+
+  validate:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -43,10 +68,23 @@ jobs:
         run: |
           npm ci
           npm run build
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.8"
+      - name: Validate infrastructure without applying
+        working-directory: infra
+        run: |
+          terraform fmt -check -recursive
+          terraform init -backend=false
+          terraform validate
 
   deploy:
-    needs: test
+    needs: [changes, validate]
+    if: ${{ (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') || (github.event_name == 'push' && needs.changes.outputs.app == 'true') }}
     runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
     steps:
       - uses: actions/checkout@v4
       - name: Configure AWS credentials with GitHub OIDC

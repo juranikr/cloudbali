@@ -39,3 +39,36 @@ variable "app_name" {
   type    = string
   default = "PATRA"
 }
+
+variable "discovery_worker_command" {
+  type        = list(string)
+  description = "Fargate command for the durable curator worker; replaceable without changing the workflow contract."
+  default     = ["python", "-m", "app.discovery_worker"]
+}
+
+variable "discovery_worker_mode" {
+  type        = string
+  description = "Worker mode passed through Step Functions so a fuller curator can replace candidate discovery later."
+  default     = "candidate_discovery"
+}
+
+variable "curation_worker_command" {
+  type        = list(string)
+  description = "Fargate command for the multi-source, proposal-only curation worker."
+  default     = ["python", "-m", "app.curation_worker"]
+}
+
+variable "operations_alert_email" {
+  type        = string
+  description = "Optional email subscription for discovery workflow alarms; AWS requires confirmation."
+  default     = ""
+}
+
+variable "place_image_cors_origins" {
+  type        = list(string)
+  description = "Additional browser origins allowed to PUT presigned place images."
+  default = [
+    "http://127.0.0.1:5173",
+    "http://localhost:5173",
+  ]
+}

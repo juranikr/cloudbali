@@ -1,5 +1,6 @@
 import { FormEvent, useEffect, useMemo, useState } from "react";
 import * as api from "./api";
+import { BRAND_NAME } from "./brand";
 import type { ChatMessage, Place, Region } from "./types";
 
 
@@ -7,6 +8,7 @@ const QUICK_PROMPTS = [
   "비 오는 날 동선을 추천해줘",
   "발리와 누사 페니다를 함께 가려면?",
   "카페와 노을 명소를 묶어줘",
+  "우붓에서 새 장소를 찾아줘",
 ];
 
 
@@ -41,7 +43,7 @@ export default function ChatPanel({
     if (!value || busy) return;
     const optimistic: ChatMessage = {
       id: -Date.now(), region_id: region?.id || null, role: "user", content: value,
-      model: "", place_ids: [], created_at: new Date().toISOString(),
+      model: "", place_ids: [], sources: [], candidates: [], created_at: new Date().toISOString(),
     };
     setMessages((current) => [...current, optimistic]);
     setText("");
@@ -80,11 +82,13 @@ export default function ChatPanel({
         {!messages.length ? <div className="chat-empty"><span>✦</span><strong>여행 취향을 말해보세요.</strong><p>지도 장소와 내 일정을 바탕으로 동선을 함께 짭니다.</p></div> : null}
         {messages.map((message) => (
           <article key={message.id} className={"chat-message chat-message--" + message.role}>
-            <small>{message.role === "user" ? "나" : "PATRA"}</small><p>{message.content}</p>
+            <small>{message.role === "user" ? "나" : BRAND_NAME}</small><p>{message.content}</p>
             {message.place_ids.length ? <div>{message.place_ids.map((id) => {
               const place = placeIndex.get(id);
               return place ? <button type="button" key={id} onClick={() => onOpenPlace(place)}>⌖ {place.title}</button> : null;
             })}</div> : null}
+            {message.candidates.length ? <ol className="chat-candidates">{message.candidates.map((candidate, index) => <li key={candidate.key}><header><b>{index + 1}</b><span><strong>{candidate.title}</strong><small>{candidate.display_name || candidate.source} · 신뢰 {Math.round(candidate.confidence * 100)}%{candidate.cross_checked ? " · 교차 확인" : ""}</small></span><em>{candidate.status === "registered" ? "등록됨" : candidate.status === "proposed" ? "승인 대기" : "조사 후보"}</em></header>{candidate.source_urls.length ? <div>{candidate.source_urls.map((url) => <a key={url} href={url} target="_blank" rel="noreferrer">근거 ↗</a>)}</div> : null}{candidate.storage_allowed && !["registered", "proposed", "approved"].includes(candidate.status) ? <button type="button" onClick={() => void submit(undefined, `${index + 1}번 등록해줘`)}>이 후보 등록 요청</button> : null}{candidate.proposal_id ? <small>운영 제안 #{candidate.proposal_id}</small> : null}</li>)}</ol> : null}
+            {message.sources.length ? <footer className="chat-sources"><span>답변 출처</span>{message.sources.map((url, index) => <a key={url} href={url} target="_blank" rel="noreferrer">{index + 1} ↗</a>)}</footer> : null}
           </article>
         ))}
         {busy ? <div className="chat-thinking">섬의 거리와 여행 조건을 살펴보는 중…</div> : null}

@@ -1,7 +1,7 @@
 import { FormEvent, useEffect, useMemo, useState } from "react";
 import * as api from "./api";
 import { BRAND_NAME } from "./brand";
-import type { AdminSummary, AdminUser, BatchRun, DiscoveryCandidate, DiscoveryRunResult, Place, PlaceAppeal, PlaceChangeEvent, Region, User } from "./types";
+import type { AdminSummary, AdminUser, AgentProposal, AgentRun, AgentRunStep, BatchRun, DiscoveryCandidate, DiscoveryRunResult, Place, PlaceAppeal, PlaceChangeEvent, Region, User } from "./types";
 
 
 const CATEGORIES = [
@@ -45,12 +45,61 @@ function candidateConfidence(value: number) {
 function candidateEvidence(value: string) {
   try {
     const parsed = JSON.parse(value) as unknown;
-    if (Array.isArray(parsed)) return parsed.map((item) => typeof item === "string" ? item : JSON.stringify(item)).join(" · ");
-    if (parsed && typeof parsed === "object") return Object.values(parsed).map((item) => typeof item === "string" ? item : JSON.stringify(item)).join(" · ");
+    if (Array.isArray(parsed)) {
+      return parsed
+        .slice(0, 4)
+        .map((item) => typeof item === "string" ? item : JSON.stringify(item))
+        .join(" · ");
+    }
+    if (parsed && typeof parsed === "object") {
+      const evidence = parsed as Record<string, unknown>;
+      const tags = evidence.osm_tags && typeof evidence.osm_tags === "object"
+        ? evidence.osm_tags as Record<string, unknown>
+        : {};
+      const signals = [
+        typeof evidence.matched_rule === "string" ? `분류 ${evidence.matched_rule}` : "",
+        typeof tags.opening_hours === "string" ? `운영시간 ${tags.opening_hours}` : "",
+        typeof tags.website === "string" || typeof tags["contact:website"] === "string" ? "공식 웹사이트 있음" : "",
+        typeof tags.wikidata === "string" || typeof tags.wikipedia === "string" ? "위키 근거 있음" : "",
+        evidence.coordinate_crs === "WGS84" ? "WGS84·권역 내 좌표" : "",
+      ].filter(Boolean);
+      return signals.join(" · ") || "OpenStreetMap 원문과 권역 내 좌표를 확인했습니다.";
+    }
   } catch {
     // Plain-text evidence is already human-readable.
   }
-  return value;
+  return value.length > 240 ? value.slice(0, 237) + "…" : value;
+}
+
+
+function candidateInactiveReason(value: string) {
+  try {
+    const parsed = JSON.parse(value) as Record<string, unknown>;
+    const tags = parsed.osm_tags && typeof parsed.osm_tags === "object"
+      ? parsed.osm_tags as Record<string, unknown>
+      : {};
+    const normalized = Object.fromEntries(
+      Object.entries(tags).map(([key, item]) => [key.toLowerCase(), String(item).trim().toLowerCase()])
+    );
+    const openingHours = normalized.opening_hours || "";
+    if (["closed", "off", "permanently_closed", "permanently closed"].includes(openingHours)) {
+      return `운영시간 ${openingHours}`;
+    }
+    for (const key of ["status", "operational_status"]) {
+      if (["closed", "disused", "abandoned", "demolished", "razed", "removed"].includes(normalized[key] || "")) {
+        return `${key}=${normalized[key]}`;
+      }
+    }
+    for (const prefix of ["disused", "abandoned", "demolished", "razed", "removed"]) {
+      const signal = Object.entries(normalized).find(([key, item]) =>
+        (key === prefix || key.startsWith(prefix + ":")) && !["", "0", "no", "false", "none", "open", "active", "operational"].includes(item)
+      );
+      if (signal) return `${signal[0]}=${signal[1]}`;
+    }
+  } catch {
+    // Legacy plain-text evidence has no machine-readable lifecycle signal.
+  }
+  return "";
 }
 
 
@@ -164,6 +213,12 @@ export default function AdminPage({
   const [discoveryLimit, setDiscoveryLimit] = useState(20);
   const [activeDiscoveryRunId, setActiveDiscoveryRunId] = useState<number | null>(null);
   const [discoveryRun, setDiscoveryRun] = useState<DiscoveryRunResult | null>(null);
+  const [agentMode, setAgentMode] = useState<AgentRun["mode"]>("full");
+  const [agentRuns, setAgentRuns] = useState<AgentRun[]>([]);
+  const [agentSteps, setAgentSteps] = useState<AgentRunStep[]>([]);
+  const [agentProposals, setAgentProposals] = useState<AgentProposal[]>([]);
+  const [activeAgentRunId, setActiveAgentRunId] = useState<number | null>(null);
+  const [agentBusy, setAgentBusy] = useState<string | null>(null);
   const [tab, setTab] = useState<"places" | "users" | "discovery" | "appeals" | "batch">("places");
   const [busy, setBusy] = useState(false);
   const [candidateBusyId, setCandidateBusyId] = useState<number | null>(null);
@@ -215,12 +270,6 @@ export default function AdminPage({
   }, [token]);
 
   useEffect(() => {
-    if (regions.length) {
-      setDiscoveryRegionId((current) => current || regions[0].id);
-    }
-  }, [regions]);
-
-  useEffect(() => {
     if (activeDiscoveryRunId === null) return;
     const runId = activeDiscoveryRunId;
     let cancelled = false;
@@ -270,6 +319,40 @@ export default function AdminPage({
       if (timerId !== undefined) window.clearTimeout(timerId);
     };
   }, [activeDiscoveryRunId, discoveryRegionId, token]);
+
+  useEffect(() => {
+    if (activeAgentRunId === null) return;
+    let cancelled = false;
+    let timerId: number | undefined;
+    async function pollAgentRun() {
+      try {
+        const [run, steps] = await Promise.all([
+          api.adminAgentRun(token, activeAgentRunId as number),
+          api.adminAgentRunSteps(token, activeAgentRunId as number),
+        ]);
+        if (cancelled) return;
+        setAgentRuns((current) => [run, ...current.filter((item) => item.id !== run.id)]);
+        setAgentSteps(steps);
+        if (run.status === "queued" || run.status === "running") {
+          setNotice(run.summary || "다중 출처를 조사하고 있습니다…");
+          timerId = window.setTimeout(() => void pollAgentRun(), 2500);
+          return;
+        }
+        setActiveAgentRunId(null);
+        setAgentProposals(await api.adminAgentProposals(token, { status: "pending", regionId: discoveryRegionId || undefined }));
+        setNotice(run.summary || "운영 조사를 마쳤습니다. 제안을 검토해 주세요.");
+      } catch (reason) {
+        if (cancelled) return;
+        setActiveAgentRunId(null);
+        setError(reason instanceof Error ? reason.message : "운영 조사 상태를 확인하지 못했습니다");
+      }
+    }
+    void pollAgentRun();
+    return () => {
+      cancelled = true;
+      if (timerId !== undefined) window.clearTimeout(timerId);
+    };
+  }, [activeAgentRunId, discoveryRegionId, token]);
 
   const coverageMax = useMemo(
     () => Math.max(1, ...summary.regions.map((region) => region.place_count)),
@@ -395,6 +478,83 @@ export default function AdminPage({
     }
   }
 
+  async function loadAgentOperations(nextRegionId = discoveryRegionId) {
+    setAgentBusy("load");
+    setError("");
+    try {
+      const [nextRuns, nextProposals] = await Promise.all([
+        api.adminAgentRuns(token, 30),
+        api.adminAgentProposals(token, { status: "pending", regionId: nextRegionId || undefined }),
+      ]);
+      setAgentRuns(nextRuns);
+      setAgentProposals(nextProposals);
+      const active = nextRuns.find((run) => run.status === "queued" || run.status === "running") || null;
+      setActiveAgentRunId(active?.id || null);
+      if (active) setAgentSteps(await api.adminAgentRunSteps(token, active.id));
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "운영 조사 정보를 불러오지 못했습니다");
+    } finally {
+      setAgentBusy(null);
+    }
+  }
+
+  async function runAgentResearch() {
+    if (activeAgentRunId !== null) return;
+    setAgentBusy("run");
+    setError("");
+    setNotice("다중 출처 운영 조사를 안전한 검토 대기열에 등록하고 있습니다…");
+    try {
+      const run = await api.adminRunAgent(token, {
+        region_id: discoveryRegionId || null,
+        mode: agentMode,
+      });
+      setAgentRuns((current) => [run, ...current.filter((item) => item.id !== run.id)]);
+      setActiveAgentRunId(run.id);
+      setAgentSteps([]);
+      setNotice(run.summary || "운영 조사가 대기 중입니다.");
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "운영 조사를 시작하지 못했습니다");
+      setNotice("");
+    } finally {
+      setAgentBusy(null);
+    }
+  }
+
+  async function decideAgentProposal(proposal: AgentProposal, decision: "approve" | "reject") {
+    const note = window.prompt(`‘${proposal.title}’ 제안을 ${decision === "approve" ? "승인" : "반려"}합니다. 판단 근거를 기록하세요.`, "");
+    if (note === null) return;
+    let force = false;
+    if (decision === "approve" && proposal.action === "merge") {
+      if (!window.confirm("병합 제안입니다. 두 장소와 근거 출처를 확인했나요?")) return;
+      force = true;
+    }
+    if (decision === "approve" && proposal.action === "create" && proposal.payload.requires_force === true) {
+      const duplicateId = Number(proposal.payload.duplicate_place_id || 0);
+      const duplicateLabel = duplicateId ? `기존 장소 #${duplicateId}` : "기존 장소";
+      if (!window.confirm(`${duplicateLabel}와 중복 가능성이 있습니다. 서로 다른 장소임을 원문과 좌표로 확인한 경우에만 강제 등록합니다.`)) return;
+      force = true;
+    }
+    setAgentBusy("proposal-" + proposal.id);
+    setError("");
+    try {
+      const updated = await api.adminDecideAgentProposal(token, proposal.id, decision, { note: note.trim(), force });
+      setAgentProposals((current) => current.filter((item) => item.id !== updated.id));
+      setNotice(`‘${updated.title}’ 제안을 ${decision === "approve" ? "반영" : "반려"}했습니다.`);
+      if (decision === "approve") {
+        const [nextSummary, nextPlaces] = await Promise.all([
+          api.adminSummary(token),
+          api.adminPlaces(token, { q: query, regionId: regionId || undefined }),
+        ]);
+        setSummary(nextSummary);
+        setPlaces(nextPlaces);
+      }
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "운영 제안을 처리하지 못했습니다");
+    } finally {
+      setAgentBusy(null);
+    }
+  }
+
   async function decideCandidate(
     candidate: DiscoveryCandidate,
     decision: "approve" | "reject",
@@ -496,6 +656,7 @@ export default function AdminPage({
     }
     if (nextTab !== "appeals") setAppealResolution("");
     setTab(nextTab);
+    if (nextTab === "discovery") void loadAgentOperations();
   }
 
   async function saveAdminUser(event: FormEvent, item: AdminUser) {
@@ -850,10 +1011,38 @@ export default function AdminPage({
         </section>
       ) : tab === "discovery" ? (
         <section className="admin__batch">
+          <section className="admin__research">
+            <header>
+              <div><small>MULTI-SOURCE CURATION</small><strong>다중 출처 운영 조사</strong><span>새 장소뿐 아니라 품질 보강·폐업/이전 재검증·중복 병합까지 조사하고, 자동 게시 없이 제안으로 남깁니다.</span></div>
+              <div>
+                <select aria-label="운영 조사 범위" value={agentMode} onChange={(event) => setAgentMode(event.target.value as AgentRun["mode"])} disabled={agentBusy !== null || activeAgentRunId !== null}>
+                  <option value="full">전체 조사</option><option value="discovery">새 장소 발굴</option><option value="quality">정보·이미지 보강</option><option value="verification">폐업·이전 재검증</option>
+                </select>
+                <button className="primary" type="button" onClick={() => void runAgentResearch()} disabled={agentBusy !== null || activeAgentRunId !== null}>{activeAgentRunId ? "운영 조사 중…" : "운영 조사 실행"}</button>
+              </div>
+            </header>
+            {activeAgentRunId ? <div className="admin__research-progress"><strong>실행 #{activeAgentRunId}</strong><span>{agentRuns.find((run) => run.id === activeAgentRunId)?.summary || "조사를 준비하고 있습니다…"}</span>{agentSteps.map((step) => <small key={step.id}>{step.outcome === "ok" || step.outcome === "success" ? "✓" : step.outcome === "failed" ? "!" : "↻"} {step.sequence}. {step.phase}{step.tool ? ` · ${step.tool}` : ""} · {step.detail}</small>)}</div> : null}
+            <div className="admin__research-summary">
+              <span><small>검토 대기 제안</small><b>{agentProposals.length}</b></span>
+              <span><small>최근 운영 조사</small><b>{agentRuns.length}</b></span>
+              <button type="button" onClick={() => void loadAgentOperations()} disabled={agentBusy !== null}>{agentBusy === "load" ? "불러오는 중…" : "조사·제안 새로고침"}</button>
+            </div>
+            <div className="admin__proposals">
+              {agentProposals.map((proposal) => (
+                <article key={proposal.id}>
+                  <i className={proposal.confidence >= .8 ? "batch-status--success" : proposal.confidence >= .6 ? "batch-status--partial" : ""} />
+                  <span><small>#{proposal.id} · {proposal.action.toUpperCase()} · 신뢰 {candidateConfidence(proposal.confidence)}</small><strong>{proposal.title}</strong><p>{proposal.evidence || "조사 근거 요약이 없습니다."}</p><details><summary>제안 값과 출처 확인</summary><pre>{JSON.stringify(proposal.payload, null, 2)}</pre>{proposal.source_urls.map((url) => <a key={url} href={url} target="_blank" rel="noreferrer">근거 원문 ↗</a>)}</details></span>
+                  <div><button className="primary" type="button" onClick={() => void decideAgentProposal(proposal, "approve")} disabled={agentBusy !== null}>승인·반영</button><button type="button" onClick={() => void decideAgentProposal(proposal, "reject")} disabled={agentBusy !== null}>반려</button></div>
+                </article>
+              ))}
+              {!agentProposals.length && !activeAgentRunId ? <p className="admin__research-empty">검토 대기 중인 운영 조사 제안이 없습니다.</p> : null}
+            </div>
+            {agentRuns.length ? <details className="admin__research-runs"><summary>최근 운영 조사 이력 {agentRuns.length}건</summary>{agentRuns.map((run) => <p key={run.id}><b>#{run.id} · {run.mode} · {run.status}</b><span>{new Date(run.started_at).toLocaleString("ko-KR")} · {run.summary}</span></p>)}</details> : null}
+          </section>
           <header>
             <div>
-              <strong>발리형 신규 장소 발굴</strong>
-              <span>공개 장소 데이터를 찾아 좌표와 중복을 검증한 뒤, 승인된 후보만 운영 지도에 등록합니다.</span>
+              <strong>빠른 공개지도 후보 수집</strong>
+              <span>OpenStreetMap에서 좌표 후보를 빠르게 모으는 보조 도구입니다. 위 운영 조사는 여러 출처와 품질·상태까지 함께 검토합니다.</span>
             </div>
             <div style={{ display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap", justifyContent: "flex-end" }}>
               <select
@@ -863,8 +1052,9 @@ export default function AdminPage({
                   const nextRegionId = Number(event.target.value);
                   setDiscoveryRegionId(nextRegionId);
                   void loadDiscoveryCandidates(nextRegionId);
+                  void loadAgentOperations(nextRegionId);
                 }}
-                disabled={busy || activeDiscoveryRunId !== null}
+                disabled={busy || activeDiscoveryRunId !== null || activeAgentRunId !== null}
                 style={{ padding: "9px 10px", border: "1px solid var(--line)", borderRadius: 8, background: "white" }}
               >
                 <option value={0}>전체 권역 (자동 배치 권장)</option>
@@ -900,13 +1090,14 @@ export default function AdminPage({
           ) : null}
           {candidates.map((candidate) => {
             const evidence = candidateEvidence(candidate.evidence);
+            const inactiveReason = candidateInactiveReason(candidate.evidence);
             return (
               <article key={candidate.id}>
                 <i className={candidate.confidence >= 0.8 ? "batch-status--success" : candidate.confidence >= 0.6 ? "batch-status--partial" : ""} />
                 <span>
                   <strong>{candidate.title}{candidate.local_name ? " · " + candidate.local_name : ""}</strong>
                   <small>{candidate.region_name} · {candidate.category} · {candidate.lat.toFixed(5)}, {candidate.lng.toFixed(5)}</small>
-                  <small title={evidence}>{evidence || "수집된 근거 요약이 없습니다."}</small>
+                  <small title={evidence}>{inactiveReason ? `등록 차단 · 폐업/철거 신호: ${inactiveReason}` : evidence || "수집된 근거 요약이 없습니다."}</small>
                   <small>
                     {candidate.source_url ? <a href={candidate.source_url} target="_blank" rel="noreferrer">{candidate.source || "근거 원문"} ↗</a> : candidate.source}
                     {candidate.status === "duplicate" ? " · 중복 의심" : ""}
@@ -915,7 +1106,12 @@ export default function AdminPage({
                 </span>
                 <div>
                   <b>신뢰도 {candidateConfidence(candidate.confidence)}</b>
-                  {candidate.status !== "duplicate" ? <button
+                  {inactiveReason ? <button
+                      type="button"
+                      disabled
+                      title="폐업·철거로 명시된 후보는 서버에서도 승인이 차단됩니다."
+                      style={{ padding: "7px 9px", borderRadius: 7 }}
+                    >등록 차단</button> : candidate.status !== "duplicate" ? <button
                       className="primary"
                       type="button"
                       onClick={() => void decideCandidate(candidate, "approve")}
@@ -981,8 +1177,8 @@ export default function AdminPage({
       ) : (
         <section className="admin__batch">
           <header><div><strong>여행 조건 갱신 배치</strong><span>6시간마다 권역 날씨와 장소 데이터 정합성을 자동 점검합니다.</span></div><button className="primary" type="button" onClick={() => void runBatch()} disabled={busy}>{busy ? "실행 중…" : "지금 실행"}</button></header>
-          {!batchRuns.length ? <div className="admin__empty"><span>↻</span><strong>아직 실행 이력이 없습니다.</strong><p>운영 스케줄 또는 수동 실행 후 결과가 쌓입니다.</p></div> : null}
-          {batchRuns.map((run) => <article key={run.id}><i className={"batch-status batch-status--" + run.status} /><span><strong>#{run.id} · {run.trigger === "manual" ? "수동" : "예약"} 실행</strong><small>{new Date(run.started_at).toLocaleString("ko-KR")} · {run.summary}</small></span><div><b>{run.status}</b><em>{run.updated_count}/{run.scanned_count} 갱신</em></div></article>)}
+          {!batchRuns.some((run) => run.kind === "travel_conditions" || run.kind === "weather" || run.kind === "maintenance") ? <div className="admin__empty"><span>↻</span><strong>아직 날씨·정합성 실행 이력이 없습니다.</strong><p>6시간 예약 실행 또는 수동 갱신 후 결과가 쌓입니다.</p></div> : null}
+          {batchRuns.filter((run) => run.kind === "travel_conditions" || run.kind === "weather" || run.kind === "maintenance").map((run) => <article key={run.id}><i className={"batch-status batch-status--" + run.status} /><span><strong>#{run.id} · {run.kind === "weather" ? "권역 날씨" : run.kind === "maintenance" ? "장소 정합성" : "여행 조건 통합"} · {run.trigger === "manual" ? "수동" : "예약"}</strong><small>{new Date(run.started_at).toLocaleString("ko-KR")} · {run.summary}</small></span><div><b>{run.status}</b><em>{run.updated_count}/{run.scanned_count} 갱신</em></div></article>)}
         </section>
       )}
     </main>

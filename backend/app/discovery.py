@@ -3,17 +3,20 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlencode
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, joinedload
 
-from app.db import Base, SessionLocal, engine
+from app.db import SessionLocal, engine
+from app.migrations import run_migrations
 from app.models import (
     BatchRun,
     DiscoveryCandidate,
@@ -56,6 +59,10 @@ class DiscoveryBusyError(RuntimeError):
         super().__init__(
             f"새 장소 발굴 실행 #{active_run_id}이 이미 대기 또는 실행 중입니다"
         )
+
+
+class CandidateInactiveError(ValueError):
+    """Raised after an authoritative source blocks and records an approval."""
 
 
 @dataclass(frozen=True)
@@ -206,6 +213,251 @@ def _clean_text(value: object, max_length: int) -> str:
     return " ".join(value.split())[:max_length]
 
 
+_INACTIVE_LIFECYCLE_PREFIXES = ("disused", "abandoned", "demolished", "razed", "removed")
+_INACTIVE_EXPLICIT_VALUES = {
+    "1", "yes", "true", "closed", "permanently_closed", "permanently closed",
+    "temporarily_closed", "temporarily closed", "temporary_closed", "inactive",
+    "non_operational", "non-operational", "not_operational",
+    "disused", "abandoned", "demolished", "razed", "removed",
+}
+_INACTIVE_FALSE_VALUES = {"", "0", "no", "false", "none", "open", "active", "operational"}
+
+
+def inactive_place_reason(tags: dict[str, str]) -> str:
+    """Return one conservative OSM lifecycle reason that blocks a new place.
+
+    Only explicit inactive tags are accepted here. Ambiguous access limits or
+    missing opening hours remain reviewable, while a literal permanent-closure
+    or lifecycle namespace can never slip through merely because other tags
+    make the candidate score look strong.
+    """
+
+    normalized = {
+        str(key).strip().casefold(): str(value).strip().casefold()
+        for key, value in tags.items()
+        if value is not None
+    }
+    opening_hours = normalized.get("opening_hours", "")
+    always_off = bool(re.match(
+        r"^(?:mo\s*-\s*su|mo\s*,\s*tu\s*,\s*we\s*,\s*th\s*,\s*fr\s*,\s*sa\s*,\s*su|24/7)\s+off(?:\s*;|$)",
+        opening_hours,
+    ))
+    if opening_hours in {"closed", "off", "permanently_closed", "permanently closed"} or always_off:
+        return f"opening_hours={opening_hours}"
+    for key in ("status", "operational_status"):
+        value = normalized.get(key, "")
+        if value in _INACTIVE_EXPLICIT_VALUES:
+            return f"{key}={value}"
+    for prefix in _INACTIVE_LIFECYCLE_PREFIXES:
+        direct = normalized.get(prefix, "")
+        if direct and direct not in _INACTIVE_FALSE_VALUES:
+            return f"{prefix}={direct}"
+        for key, value in normalized.items():
+            if key.startswith(prefix + ":") and value not in _INACTIVE_FALSE_VALUES:
+                return f"{key}={value}"
+    return ""
+
+
+def _candidate_inactive_reason(candidate: DiscoveryCandidate) -> str:
+    try:
+        evidence = json.loads(candidate.evidence or "{}")
+    except (TypeError, json.JSONDecodeError):
+        return ""
+    tags = evidence.get("osm_tags") if isinstance(evidence, dict) else None
+    if not isinstance(tags, dict):
+        return ""
+    return inactive_place_reason({str(key): str(value) for key, value in tags.items()})
+
+
+def _official_json(url: str, *, timeout: float = 8.0) -> dict:
+    request = Request(
+        url,
+        headers={
+            "User-Agent": "cloudbali-place-approval/1.0 (admin-reviewed candidates)",
+            "Accept": "application/json",
+        },
+    )
+    with urlopen(request, timeout=timeout) as response:
+        if "json" not in (response.headers.get("Content-Type") or "").lower():
+            raise ValueError("공식 출처가 JSON으로 응답하지 않았습니다")
+        payload = json.loads(response.read(1_500_001).decode("utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("공식 출처 응답 형식이 올바르지 않습니다")
+    return payload
+
+
+def _candidate_references(candidate: DiscoveryCandidate) -> list[tuple[str, str]]:
+    references = [(candidate.source.strip().casefold(), candidate.external_id.strip())]
+    try:
+        evidence = json.loads(candidate.evidence or "{}")
+    except (TypeError, json.JSONDecodeError):
+        evidence = {}
+    chat_research = evidence.get("chat_research") if isinstance(evidence, dict) else None
+    external_ids = chat_research.get("external_ids") if isinstance(chat_research, dict) else None
+    if isinstance(external_ids, dict):
+        references.extend(
+            (str(source).strip().casefold(), str(external_id).strip())
+            for source, external_id in external_ids.items()
+        )
+    return list(dict.fromkeys(
+        (source, external_id)
+        for source, external_id in references
+        if source in {"openstreetmap", "wikidata"} and external_id
+    ))
+
+
+def _coordinate_revalidation(
+    candidate: DiscoveryCandidate,
+    latitude: object,
+    longitude: object,
+    *,
+    max_drift_m: float = 300.0,
+) -> dict | None:
+    try:
+        live_lat = float(latitude)
+        live_lng = float(longitude)
+        candidate_lat = float(candidate.lat)
+        candidate_lng = float(candidate.lng)
+    except (AttributeError, TypeError, ValueError):
+        return None
+    if not (-90 <= live_lat <= 90 and -180 <= live_lng <= 180):
+        return None
+    drift_m = _distance_m(candidate_lat, candidate_lng, live_lat, live_lng)
+    return {
+        "lat": live_lat,
+        "lng": live_lng,
+        "drift_m": round(drift_m, 1),
+        "verified": drift_m <= max_drift_m,
+        "max_drift_m": max_drift_m,
+    }
+
+
+def _wikidata_coordinate(claims: dict) -> tuple[object, object]:
+    coordinate_claims = claims.get("P625")
+    if not isinstance(coordinate_claims, list):
+        return None, None
+    for claim in coordinate_claims:
+        try:
+            value = claim["mainsnak"]["datavalue"]["value"]
+            if isinstance(value, dict):
+                return value.get("latitude"), value.get("longitude")
+        except (KeyError, TypeError):
+            continue
+    return None, None
+
+
+def revalidate_candidate_lifecycle(candidate: DiscoveryCandidate) -> tuple[str, dict]:
+    """Fail closed unless every storable identity is live at approval time."""
+
+    checked_at = datetime.now(timezone.utc).isoformat()
+    checks: list[dict] = []
+    verified_coordinate: dict | None = None
+    references = _candidate_references(candidate)
+    if not references:
+        raise RuntimeError("최신 상태를 확인할 수 있는 저장 가능 출처가 없습니다")
+    for source, external_id in references:
+        if source == "openstreetmap":
+            match = re.fullmatch(r"(node|way|relation)/(\d+)", external_id)
+            if match is None:
+                raise RuntimeError("OpenStreetMap 객체 식별자가 올바르지 않습니다")
+            osm_type, osm_id_text = match.groups()
+            url = f"https://api.openstreetmap.org/api/0.6/{osm_type}/{osm_id_text}.json"
+            try:
+                payload = _official_json(url)
+            except HTTPError as exc:
+                if exc.code in {404, 410}:
+                    return f"OpenStreetMap 객체가 삭제되었거나 더 이상 공개되지 않음 ({exc.code})", {
+                        "checked_at": checked_at,
+                        "checks": checks + [{"source": source, "external_id": external_id, "url": url, "active": False}],
+                    }
+                raise
+            elements = payload.get("elements")
+            element = next((
+                item for item in elements if isinstance(item, dict)
+                and item.get("type") == osm_type and str(item.get("id")) == osm_id_text
+            ), None) if isinstance(elements, list) else None
+            if element is None:
+                return "OpenStreetMap 원문에서 동일 객체를 확인하지 못함", {
+                    "checked_at": checked_at,
+                    "checks": checks + [{"source": source, "external_id": external_id, "url": url, "active": False}],
+                }
+            raw_tags = element.get("tags") if isinstance(element.get("tags"), dict) else {}
+            tags = {str(key): str(value) for key, value in raw_tags.items() if value is not None}
+            reason = inactive_place_reason(tags)
+            center = element.get("center") if isinstance(element.get("center"), dict) else {}
+            coordinate_check = _coordinate_revalidation(
+                candidate,
+                element.get("lat", center.get("lat")),
+                element.get("lon", center.get("lon")),
+            )
+            check = {
+                "source": source,
+                "external_id": external_id,
+                "url": url,
+                "active": not bool(reason),
+                "inactive_reason": reason,
+                "osm_tags": tags,
+                "coordinate": coordinate_check,
+            }
+            checks.append(check)
+            if reason:
+                return reason, {"checked_at": checked_at, "checks": checks}
+            if coordinate_check is not None and not coordinate_check["verified"]:
+                check["active"] = False
+                check["inactive_reason"] = "원문 좌표가 후보 위치에서 크게 이동함"
+                return check["inactive_reason"], {"checked_at": checked_at, "checks": checks}
+            if coordinate_check is not None and source == str(candidate.source).strip().casefold():
+                verified_coordinate = {"source": source, **coordinate_check}
+            continue
+
+        if not re.fullmatch(r"Q\d+", external_id, flags=re.IGNORECASE):
+            raise RuntimeError("Wikidata 객체 식별자가 올바르지 않습니다")
+        entity_id = external_id.upper()
+        url = f"https://www.wikidata.org/wiki/Special:EntityData/{entity_id}.json"
+        payload = _official_json(url)
+        entities = payload.get("entities")
+        entity = entities.get(entity_id) if isinstance(entities, dict) else None
+        if not isinstance(entity, dict) or "missing" in entity:
+            return "Wikidata 원문에서 동일 장소를 확인하지 못함", {
+                "checked_at": checked_at,
+                "checks": checks + [{"source": source, "external_id": entity_id, "url": url, "active": False}],
+            }
+        claims = entity.get("claims") if isinstance(entity.get("claims"), dict) else {}
+        inactive_properties = [property_id for property_id in ("P576", "P582") if claims.get(property_id)]
+        has_coordinates = bool(claims.get("P625"))
+        live_lat, live_lng = _wikidata_coordinate(claims)
+        coordinate_check = _coordinate_revalidation(candidate, live_lat, live_lng)
+        reason = (
+            "Wikidata에 폐지·철거 또는 종료 시점이 기록됨 (" + ", ".join(inactive_properties) + ")"
+            if inactive_properties else ""
+        )
+        if not reason and not has_coordinates:
+            reason = "Wikidata 원문에서 장소 좌표가 제거됨"
+        check = {
+            "source": source,
+            "external_id": entity_id,
+            "url": url,
+            "active": not bool(reason),
+            "inactive_reason": reason,
+            "coordinate_claim_present": has_coordinates,
+            "coordinate": coordinate_check,
+        }
+        checks.append(check)
+        if reason:
+            return reason, {"checked_at": checked_at, "checks": checks}
+        if coordinate_check is not None and not coordinate_check["verified"]:
+            check["active"] = False
+            check["inactive_reason"] = "원문 좌표가 후보 위치에서 크게 이동함"
+            return check["inactive_reason"], {"checked_at": checked_at, "checks": checks}
+        if coordinate_check is not None and source == str(candidate.source).strip().casefold():
+            verified_coordinate = {"source": source, **coordinate_check}
+    return "", {
+        "checked_at": checked_at,
+        "checks": checks,
+        "verified_coordinate": verified_coordinate,
+    }
+
+
 def _confidence(tags: dict[str, str]) -> float:
     score = 0.54
     if tags.get("name:en") or tags.get("name:id") or tags.get("name:ko"):
@@ -232,6 +484,8 @@ def _candidate_values(region: Region, element: dict) -> CandidateValues | None:
     if not isinstance(tags, dict):
         return None
     tags = {str(key): str(value) for key, value in tags.items() if value is not None}
+    if inactive_place_reason(tags):
+        return None
     mapped = _category(tags)
     coordinates = _coordinates(element)
     name = _clean_text(tags.get("name"), 180)
@@ -329,15 +583,14 @@ def find_duplicate_place(values: CandidateValues, places: list[Place]) -> Place 
 
 
 def _candidate_duplicates(values: CandidateValues, candidates: list[DiscoveryCandidate]) -> bool:
-    names = {_normalized_name(values.title), _normalized_name(values.local_name)} - {""}
-    for candidate in candidates:
-        distance = _distance_m(values.lat, values.lng, candidate.lat, candidate.lng)
-        other_names = {_normalized_name(candidate.title), _normalized_name(candidate.local_name)} - {""}
-        if names & other_names and distance <= 300:
-            return True
-        if candidate.category == values.category and distance <= 15:
-            return True
-    return False
+    # Only an identical provider object is safe to suppress before review.
+    # Same-name branches and replacement businesses can sit a few metres apart;
+    # those must remain durable candidates with duplicate evidence instead of
+    # disappearing because an older (even rejected) candidate happened to be near.
+    return any(
+        candidate.source == SOURCE and candidate.external_id == values.external_id
+        for candidate in candidates
+    )
 
 
 def _allocate_limits(regions: list[Region], total_limit: int) -> dict[int, int]:
@@ -608,6 +861,29 @@ def _claim_discovery_run(
     return run, job, claimed == 1
 
 
+def _locked_active_places_by_region(
+    db: Session,
+    region_ids: list[int],
+) -> dict[int, list[Place]]:
+    """Lock one global Place-ID sequence, then group it for duplicate checks."""
+
+    ids = sorted(set(region_ids))
+    grouped = {region_id: [] for region_id in ids}
+    if not ids:
+        return grouped
+    rows = (
+        db.query(Place)
+        .filter(Place.region_id.in_(ids), Place.merged_into_id.is_(None))
+        .order_by(Place.id)
+        .populate_existing()
+        .with_for_update()
+        .all()
+    )
+    for row in rows:
+        grouped[row.region_id].append(row)
+    return grouped
+
+
 def _execute_discovery_run(db: Session, run_id: int) -> DiscoveryRunOut:
     run, job, claimed = _claim_discovery_run(db, run_id)
     if not claimed:
@@ -651,22 +927,24 @@ def _execute_discovery_run(db: Session, run_id: int) -> DiscoveryRunOut:
                 except Exception as exc:
                     failures.append(f"{region.name_ko}: {type(exc).__name__}")
 
-        places_by_region = {
-            region.id: db.query(Place).filter(Place.region_id == region.id).all()
-            for region in regions
-        }
-        existing_source_ids = {
-            row[0]
-            for row in db.query(DiscoveryCandidate.external_id).filter(
-                DiscoveryCandidate.source == SOURCE
-            ).all()
+        # Provider I/O is complete. Lock existing candidate rows before active
+        # Places in the same order used by merge, then build duplicate links
+        # from a current snapshot. A merge that wins first is already visible;
+        # a merge that waits will re-scan and move these new candidate links.
+        existing_candidate_rows = db.query(DiscoveryCandidate).filter(
+            DiscoveryCandidate.source == SOURCE
+        ).order_by(DiscoveryCandidate.id).populate_existing().with_for_update().all()
+        existing_candidates_by_source_id = {
+            row.external_id: row
+            for row in existing_candidate_rows
         }
         candidates_by_region = {
-            region.id: db.query(DiscoveryCandidate).filter(
-                DiscoveryCandidate.region_id == region.id
-            ).all()
+            region.id: [row for row in existing_candidate_rows if row.region_id == region.id]
             for region in regions
         }
+        places_by_region = _locked_active_places_by_region(
+            db, [region.id for region in regions]
+        )
         scanned = 0
         created = 0
         duplicates = 0
@@ -682,9 +960,51 @@ def _execute_discovery_run(db: Session, run_id: int) -> DiscoveryRunOut:
                 if values is None:
                     invalid += 1
                     continue
-                if values.external_id in existing_source_ids or _candidate_duplicates(
-                    values, candidates_by_region[region.id]
-                ):
+                existing_candidate = existing_candidates_by_source_id.get(values.external_id)
+                if existing_candidate is not None:
+                    if (
+                        existing_candidate.status == "rejected"
+                        and (existing_candidate.decision_note or "").startswith("자동 상태 차단:")
+                    ):
+                        duplicate_place = find_duplicate_place(values, places_by_region[region.id])
+                        next_status = "duplicate" if duplicate_place else "pending"
+                        previous_status = existing_candidate.status
+                        existing_candidate.discovery_run_id = run.id
+                        existing_candidate.region_id = region.id
+                        existing_candidate.source_url = values.source_url
+                        existing_candidate.title = values.title
+                        existing_candidate.local_name = values.local_name
+                        existing_candidate.description = values.description
+                        existing_candidate.area = values.area
+                        existing_candidate.category = values.category
+                        existing_candidate.lat = values.lat
+                        existing_candidate.lng = values.lng
+                        existing_candidate.confidence = values.confidence
+                        existing_candidate.evidence = values.evidence
+                        existing_candidate.tags = values.tags
+                        existing_candidate.status = next_status
+                        existing_candidate.duplicate_place_id = duplicate_place.id if duplicate_place else None
+                        existing_candidate.result_place_id = None
+                        existing_candidate.decision_note = "공개 지도에서 활성 상태를 다시 확인해 검토 대기로 복원했습니다"
+                        existing_candidate.decided_by_id = None
+                        existing_candidate.decided_at = None
+                        db.add(DiscoveryDecision(
+                            candidate_id=existing_candidate.id,
+                            admin_id=None,
+                            action="auto_reactivated",
+                            from_status=previous_status,
+                            to_status=next_status,
+                            note=existing_candidate.decision_note,
+                            place_id=duplicate_place.id if duplicate_place else None,
+                        ))
+                        if duplicate_place:
+                            duplicates += 1
+                        created += 1
+                        region_created += 1
+                        continue
+                    duplicates += 1
+                    continue
+                if _candidate_duplicates(values, candidates_by_region[region.id]):
                     duplicates += 1
                     continue
                 duplicate_place = find_duplicate_place(values, places_by_region[region.id])
@@ -717,10 +1037,9 @@ def _execute_discovery_run(db: Session, run_id: int) -> DiscoveryRunOut:
                 except IntegrityError:
                     # Another overlapping run stored this source object first.
                     duplicates += 1
-                    existing_source_ids.add(values.external_id)
                     continue
                 candidates_by_region[region.id].append(candidate)
-                existing_source_ids.add(values.external_id)
+                existing_candidates_by_source_id[values.external_id] = candidate
                 created += 1
                 region_created += 1
 
@@ -796,12 +1115,119 @@ def _execute_discovery_run(db: Session, run_id: int) -> DiscoveryRunOut:
         raise
 
 
+def prepare_discovery_retry(db: Session, run_id: int) -> DiscoveryRunOut:
+    """Safely re-queue the same run before a Step Functions task retry.
+
+    Infrastructure retries can arrive after a Fargate task was stopped while
+    the database still says ``queued``/``running``, or after a provider failure
+    was finalized as ``failed``. A successful/partial run is never reopened and
+    another run's global lease is never stolen.
+    """
+
+    try:
+        active_job = (
+            db.query(DiscoveryJob)
+            .filter(DiscoveryJob.active_slot == ACTIVE_DISCOVERY_SLOT)
+            .with_for_update()
+            .first()
+        )
+        if active_job is not None and active_job.batch_run_id != run_id:
+            raise DiscoveryBusyError(active_job.batch_run_id)
+
+        job = (
+            db.query(DiscoveryJob)
+            .filter(DiscoveryJob.batch_run_id == run_id)
+            .with_for_update()
+            .first()
+        )
+        run = (
+            db.query(BatchRun)
+            .filter(BatchRun.id == run_id, BatchRun.kind == "place_discovery")
+            .with_for_update()
+            .first()
+        )
+        if job is None or run is None:
+            raise LookupError("발굴 실행 이력을 찾을 수 없습니다")
+        if run.status in {"success", "partial"}:
+            db.commit()
+            return _discovery_run_out(run, job)
+        if run.status not in {"queued", "running", "failed"}:
+            raise RuntimeError(f"재시도할 수 없는 발굴 상태입니다: {run.status}")
+
+        job.active_slot = ACTIVE_DISCOVERY_SLOT
+        job.duplicate_count = 0
+        job.invalid_count = 0
+        run.status = "queued"
+        run.scanned_count = 0
+        run.updated_count = 0
+        run.summary = "내구성 워크플로가 장소 발굴 작업을 재시도합니다"
+        run.finished_at = None
+        db.commit()
+        db.refresh(run)
+        db.refresh(job)
+        return _discovery_run_out(run, job)
+    except Exception:
+        db.rollback()
+        raise
+
+
+def finalize_discovery_dispatch_failure(
+    db: Session,
+    run_id: int,
+    *,
+    summary: str = "내구성 발굴 워크플로를 시작하지 못했습니다",
+) -> DiscoveryRunOut:
+    """Release a queued run when Step Functions could not be dispatched.
+
+    This is deliberately conditional: an ambiguous HTTP timeout can race with
+    a worker that actually started, and the API must never overwrite a run
+    that has already finished.
+    """
+
+    try:
+        job = (
+            db.query(DiscoveryJob)
+            .filter(DiscoveryJob.batch_run_id == run_id)
+            .with_for_update()
+            .first()
+        )
+        run = (
+            db.query(BatchRun)
+            .filter(BatchRun.id == run_id, BatchRun.kind == "place_discovery")
+            .with_for_update()
+            .first()
+        )
+        if job is None or run is None:
+            raise LookupError("발굴 실행 이력을 찾을 수 없습니다")
+        if run.status == "queued":
+            run.status = "failed"
+            run.summary = summary
+            run.finished_at = datetime.now(timezone.utc)
+            if job.active_slot == ACTIVE_DISCOVERY_SLOT:
+                job.active_slot = None
+            db.commit()
+            db.refresh(run)
+            db.refresh(job)
+        else:
+            db.rollback()
+        return _discovery_run_out(run, job)
+    except Exception:
+        db.rollback()
+        raise
+
+
+def execute_discovery_run(db: Session, run_id: int) -> DiscoveryRunOut:
+    """Execute one pre-created run and preserve failures for workflow polling."""
+
+    return _execute_discovery_run(db, run_id)
+
+
 def execute_queued_discovery(run_id: int) -> None:
     """FastAPI background-task entry point with an independent DB session."""
 
     with SessionLocal() as db:
         try:
-            _execute_discovery_run(db, run_id)
+            execute_discovery_run(db, run_id)
         except Exception:
             # _execute_discovery_run already persisted a concise failed state.
             return
@@ -945,10 +1371,12 @@ def approve_candidate(
     *,
     note: str = "",
     force: bool = False,
+    commit: bool = True,
 ) -> DiscoveryCandidateOut:
     candidate = (
         db.query(DiscoveryCandidate)
         .filter(DiscoveryCandidate.id == candidate_id)
+        .populate_existing()
         .with_for_update()
         .first()
     )
@@ -956,9 +1384,69 @@ def approve_candidate(
         raise LookupError("후보를 찾을 수 없습니다")
     if candidate.status not in {"pending", "duplicate"}:
         raise ValueError("대기 또는 중복 후보만 승인할 수 있습니다")
+    inactive_reason = _candidate_inactive_reason(candidate)
+    if inactive_reason:
+        raise ValueError(
+            "공개 지도에 폐업·철거 등 비활성 신호가 있어 승인할 수 없습니다: "
+            + inactive_reason
+        )
+    try:
+        live_inactive_reason, live_evidence = revalidate_candidate_lifecycle(candidate)
+    except Exception as exc:
+        raise ValueError(
+            "최신 운영 상태를 확인하지 못해 승인하지 않았습니다. 잠시 후 다시 시도해 주세요"
+        ) from exc
+    try:
+        evidence = json.loads(candidate.evidence or "{}")
+    except (TypeError, json.JSONDecodeError):
+        evidence = {}
+    evidence = evidence if isinstance(evidence, dict) else {}
+    evidence["approval_revalidation"] = live_evidence
+    candidate.evidence = json.dumps(evidence, ensure_ascii=False, separators=(",", ":"))
+    if live_inactive_reason:
+        previous = candidate.status
+        candidate.status = "rejected"
+        candidate.decision_note = "자동 상태 차단: " + live_inactive_reason
+        candidate.decided_by_id = admin.id
+        candidate.decided_at = datetime.now(timezone.utc)
+        _append_decision(
+            db,
+            candidate,
+            admin,
+            action="approval_blocked_inactive",
+            from_status=previous,
+            to_status="rejected",
+            note=candidate.decision_note,
+            place_id=None,
+        )
+        if commit:
+            db.commit()
+        else:
+            db.flush()
+        raise CandidateInactiveError(
+            "공식 원문에 비활성 또는 장소 식별 변경 신호가 있어 승인할 수 없습니다: "
+            + live_inactive_reason
+        )
+
+    verified_coordinate = live_evidence.get("verified_coordinate") if isinstance(live_evidence, dict) else None
+    if isinstance(verified_coordinate, dict) and verified_coordinate.get("verified"):
+        candidate.lat = float(verified_coordinate["lat"])
+        candidate.lng = float(verified_coordinate["lng"])
 
     values = _values_from_candidate(candidate)
-    places = db.query(Place).filter(Place.region_id == candidate.region_id).all()
+    # Serialize approvals within one travel region. Candidate row locks alone
+    # cannot protect an empty duplicate-search range when two different source
+    # objects for the same place are approved concurrently.
+    region = (
+        db.query(Region)
+        .filter(Region.id == candidate.region_id)
+        .with_for_update()
+        .one()
+    )
+    places = db.query(Place).filter(
+        Place.region_id == candidate.region_id,
+        Place.merged_into_id.is_(None),
+    ).order_by(Place.id).populate_existing().with_for_update().all()
     duplicate = find_duplicate_place(values, places)
     if duplicate and not force:
         previous = candidate.status
@@ -973,24 +1461,26 @@ def approve_candidate(
                 action="duplicate_detected", from_status=previous, to_status="duplicate",
                 note=candidate.decision_note, place_id=duplicate.id,
             )
-        db.commit()
+        if commit:
+            db.commit()
+        else:
+            db.flush()
         return candidate_out(get_candidate(db, candidate.id))
 
     category_defaults = {
         "beach": 150, "culture": 90, "nature": 150, "food": 90, "cafe": 75,
         "surf": 180, "dive": 180, "wellness": 120, "nightlife": 120,
-        "transport": 60, "other": 90,
+        "transport": 60, "stay": 60, "shop": 75, "other": 90,
     }
     water_sensitive = candidate.category in {"beach", "surf", "dive"}
     weather_sensitive = candidate.category in {"beach", "nature", "surf", "dive"}
-    region = candidate.region
     place = Place(
         region_id=candidate.region_id,
         creator_id=admin.id,
         category=candidate.category,
         title=candidate.title,
         local_name=candidate.local_name,
-        description=candidate.description or "OpenStreetMap 공개 데이터에서 발굴해 관리자가 승인한 장소입니다.",
+        description=candidate.description or "공개 출처에서 발굴해 관리자가 검토·승인한 장소입니다.",
         area=candidate.area,
         lat=candidate.lat,
         lng=candidate.lng,
@@ -1005,7 +1495,14 @@ def approve_candidate(
         traveler_note="자동 발굴된 장소입니다. 방문 전 최신 영업·접근·안전 정보를 원문에서 확인하세요.",
         tags=candidate.tags,
         source_url=candidate.source_url,
-        coordinate_source="openstreetmap",
+        coordinate_source=(candidate.source or "public_source")[:60],
+        coordinate_external_id=candidate.external_id,
+        coordinate_confidence=max(0.0, min(candidate.confidence, 1.0)),
+        coordinate_verified_at=(
+            datetime.now(timezone.utc)
+            if isinstance(verified_coordinate, dict) and verified_coordinate.get("verified")
+            else None
+        ),
         coordinate_crs="WGS84",
     )
     db.add(place)
@@ -1016,7 +1513,7 @@ def approve_candidate(
         actor_id=admin.id,
         event_type="place_created",
         summary="관리자가 자동 발굴 후보를 승인했습니다",
-        metadata={"source": SOURCE, "candidate_id": candidate.id},
+        metadata={"source": candidate.source or SOURCE, "candidate_id": candidate.id},
     )
     previous = candidate.status
     candidate.status = "approved"
@@ -1029,7 +1526,10 @@ def approve_candidate(
         action="approved_forced" if force and duplicate else "approved",
         from_status=previous, to_status="approved", note=note, place_id=place.id,
     )
-    db.commit()
+    if commit:
+        db.commit()
+    else:
+        db.flush()
     return candidate_out(get_candidate(db, candidate.id))
 
 
@@ -1068,7 +1568,7 @@ def main() -> None:
     parser.add_argument("--region", help="region slug; omit to scan all configured regions")
     parser.add_argument("--limit", type=_cli_limit, default=80)
     args = parser.parse_args()
-    Base.metadata.create_all(bind=engine)
+    run_migrations(engine)
     with SessionLocal() as db:
         region_id = None
         if args.region:

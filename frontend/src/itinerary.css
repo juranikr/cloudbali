@@ -426,6 +426,9 @@
   color: var(--itinerary-muted);
   font-size: .56rem;
 }
+.itinerary-days__tools { display: flex; gap: 8px; align-items: center; }
+.itinerary-days__tools small { color: var(--itinerary-muted); font-size: .52rem; }
+.itinerary-days__tools button { padding: 7px 8px; border: 1px solid var(--itinerary-line); border-radius: 7px; background: white; font-size: .51rem; cursor: pointer; }
 
 .itinerary-days__empty {
   display: grid;
@@ -495,7 +498,8 @@
   font-size: .52rem;
 }
 
-.itinerary-day > header > button {
+.itinerary-day > header > button,
+.itinerary-day__header-actions button {
   padding: 6px 7px;
   border: 0;
   background: transparent;
@@ -503,6 +507,11 @@
   font-size: .52rem;
   cursor: pointer;
 }
+.itinerary-day__header-actions { display: flex; gap: 4px; }
+.itinerary-day__note { margin: 0; padding: 10px 17px; border-bottom: 1px solid var(--itinerary-line); background: #fffdf8; color: var(--itinerary-muted); font-size: .57rem; line-height: 1.6; white-space: pre-wrap; }
+.itinerary-day__edit { display: grid; grid-template-columns: 1fr 1.5fr; padding: 13px 17px; border-bottom: 1px solid var(--itinerary-line); gap: 8px; background: #f1f6f3; }
+.itinerary-day__edit footer { display: flex; grid-column: 1 / -1; justify-content: flex-end; gap: 6px; }
+.itinerary-day__edit footer button { padding: 7px 9px; border: 1px solid var(--itinerary-line); border-radius: 7px; background: white; font-size: .52rem; cursor: pointer; }
 
 .itinerary-day__items {
   padding: 0 17px;
@@ -592,6 +601,11 @@
   border-color: rgba(169, 74, 57, .2);
   color: #a94a39;
 }
+.itinerary-item__edit { display: grid; grid-column: 1 / -1; grid-template-columns: 100px 100px minmax(180px, 1fr) auto; width: 100%; padding: 10px 0; gap: 7px; }
+.itinerary-item__edit label { display: grid; gap: 3px; color: var(--itinerary-muted); font-size: .48rem; }
+.itinerary-item__edit input { min-width: 0; padding: 7px 8px; border: 1px solid var(--itinerary-line); border-radius: 7px; font-size: .54rem; }
+.itinerary-item__edit footer { display: flex; align-items: flex-end; gap: 4px; }
+.itinerary-item__edit footer button { padding: 7px 8px; border: 1px solid var(--itinerary-line); border-radius: 7px; background: white; font-size: .5rem; }
 
 .itinerary-add-place {
   width: 100%;
@@ -961,6 +975,10 @@
   .itinerary-sharing > header {
     align-items: flex-start;
   }
+  .itinerary-days > header { gap: 10px; flex-direction: column; }
+  .itinerary-days__tools { width: 100%; justify-content: space-between; }
+  .itinerary-day__edit, .itinerary-item__edit { grid-template-columns: 1fr; }
+  .itinerary-item__edit footer, .itinerary-day__edit footer { grid-column: auto; justify-content: flex-end; }
 
   .itinerary-sharing > header > small {
     display: none;

@@ -18,7 +18,9 @@ class User(Base):
     password_hash: Mapped[str] = mapped_column(String(255))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
-    places: Mapped[list["Place"]] = relationship(back_populates="creator")
+    places: Mapped[list["Place"]] = relationship(
+        back_populates="creator", foreign_keys="Place.creator_id"
+    )
     favorites: Mapped[list["Favorite"]] = relationship(back_populates="user", cascade="all, delete-orphan")
     trip_stops: Mapped[list["TripStop"]] = relationship(back_populates="user", cascade="all, delete-orphan")
 
@@ -59,6 +61,17 @@ class Place(Base):
     creator_id: Mapped[Optional[int]] = mapped_column(
         ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
     )
+    chain_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("place_chains.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    branch_name: Mapped[str] = mapped_column(String(120), default="")
+    merged_into_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("places.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    merged_by_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    merged_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     category: Mapped[str] = mapped_column(String(30), index=True)
     title: Mapped[str] = mapped_column(String(180))
     local_name: Mapped[str] = mapped_column(String(180), default="")
@@ -78,6 +91,11 @@ class Place(Base):
     tags: Mapped[str] = mapped_column(Text, default="")
     source_url: Mapped[str] = mapped_column(String(1000), default="")
     coordinate_source: Mapped[str] = mapped_column(String(60), default="manual")
+    coordinate_external_id: Mapped[str] = mapped_column(String(200), default="")
+    coordinate_confidence: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    coordinate_verified_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     coordinate_crs: Mapped[str] = mapped_column(String(20), default="WGS84")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
@@ -85,7 +103,9 @@ class Place(Base):
     )
 
     region: Mapped[Region] = relationship(back_populates="places")
-    creator: Mapped[Optional[User]] = relationship(back_populates="places")
+    creator: Mapped[Optional[User]] = relationship(
+        back_populates="places", foreign_keys=[creator_id]
+    )
     favorites: Mapped[list["Favorite"]] = relationship(back_populates="place", cascade="all, delete-orphan")
     trip_stops: Mapped[list["TripStop"]] = relationship(back_populates="place", cascade="all, delete-orphan")
 
@@ -133,7 +153,36 @@ class ChatMessage(Base):
     content: Mapped[str] = mapped_column(Text)
     model: Mapped[str] = mapped_column(String(100), default="")
     place_ids: Mapped[str] = mapped_column(Text, default="")
+    # Grounded research state is deliberately kept apart from prose. A later
+    # "등록해줘" turn can refer to exact sourced candidates without reparsing
+    # an assistant sentence or trusting a model-invented coordinate.
+    sources: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+    candidates: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+    tool_trace: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+
+
+class ChatWork(Base):
+    """Durable, resumable state behind a multi-turn Bali travel request."""
+
+    __tablename__ = "chat_work"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    region_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("regions.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    status: Mapped[str] = mapped_column(String(20), default="active", nullable=False, index=True)
+    action: Mapped[str] = mapped_column(String(30), default="answer", nullable=False)
+    scope: Mapped[str] = mapped_column(String(30), default="all_islands", nullable=False)
+    subject: Mapped[str] = mapped_column(String(160), default="", nullable=False)
+    goal: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    requested_count: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    state: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), index=True
+    )
 
 
 class RegionSnapshot(Base):

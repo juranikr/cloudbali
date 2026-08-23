@@ -7,14 +7,21 @@ from urllib.parse import urlsplit
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, ValidationError, field_validator, model_validator
-from sqlalchemy import func
+from sqlalchemy import func, or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.auth import get_admin_user, get_current_user, hash_password
+from app.collaboration import notify_users
 from app.config import settings
 from app.db import get_db
 from app.extended_models import PlaceAppeal, PlaceChangeEvent, PlaceImage, PlaceNote
+from app.image_storage import (
+    ManagedImageDeleteError,
+    ManagedImageStorageError,
+    ManagedImageStorageNotConfigured,
+    delete_recorded_upload_object,
+)
 from app.itinerary_models import TravelPlan
 from app.models import Favorite, Place, Region, TripStop, User
 
@@ -56,6 +63,7 @@ class AdminUserOut(BaseModel):
 
 class NoteCreate(BaseModel):
     content: str = Field(min_length=1, max_length=5000)
+    visibility: Literal["shared", "private"] = "shared"
 
     @field_validator("content")
     @classmethod
@@ -66,8 +74,27 @@ class NoteCreate(BaseModel):
         return cleaned
 
 
-class NoteUpdate(NoteCreate):
-    pass
+class NoteUpdate(BaseModel):
+    content: str | None = Field(default=None, min_length=1, max_length=5000)
+    visibility: Literal["shared", "private"] | None = None
+
+    @field_validator("content")
+    @classmethod
+    def clean_content(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("메모 내용을 입력해 주세요")
+        return cleaned
+
+    @model_validator(mode="after")
+    def require_change(self) -> "NoteUpdate":
+        if not self.model_fields_set:
+            raise ValueError("변경할 메모 정보가 필요합니다")
+        if any(getattr(self, field) is None for field in self.model_fields_set):
+            raise ValueError("메모 수정 값은 null일 수 없습니다")
+        return self
 
 
 class NoteOut(BaseModel):
@@ -76,6 +103,7 @@ class NoteOut(BaseModel):
     user_id: int
     author_name: str
     content: str
+    visibility: str
     is_mine: bool
     can_edit: bool
     created_at: datetime
@@ -214,13 +242,20 @@ class PlaceRollbackSnapshot(BaseModel):
     tags: str | list[str] | None = None
     source_url: str | None = Field(default=None, max_length=1000)
     coordinate_source: str | None = Field(default=None, max_length=60)
+    coordinate_external_id: str | None = Field(default=None, max_length=200)
+    coordinate_confidence: float | None = Field(default=None, ge=0, le=1)
     coordinate_crs: Literal["WGS84"] | None = None
 
     @model_validator(mode="after")
     def require_concrete_values(self) -> "PlaceRollbackSnapshot":
         if not self.model_fields_set:
             raise ValueError("복원할 이전 값이 없습니다")
-        if any(getattr(self, field) is None for field in self.model_fields_set):
+        nullable_fields = {"coordinate_confidence"}
+        if any(
+            getattr(self, field) is None
+            for field in self.model_fields_set
+            if field not in nullable_fields
+        ):
             raise ValueError("복원 값에는 null을 사용할 수 없습니다")
         if isinstance(self.tags, list):
             cleaned = [str(item).strip() for item in self.tags if str(item).strip()]
@@ -292,8 +327,14 @@ def _is_admin(user: User) -> bool:
     return user.email.lower() in settings.admin_email_list
 
 
-def _require_place(db: Session, place_id: int) -> Place:
-    place = db.get(Place, place_id)
+def _require_place(db: Session, place_id: int, *, lock: bool = False) -> Place:
+    query = db.query(Place).filter(
+        Place.id == place_id,
+        Place.merged_into_id.is_(None),
+    )
+    if lock:
+        query = query.populate_existing().with_for_update()
+    place = query.first()
     if place is None:
         raise HTTPException(status_code=404, detail="장소를 찾을 수 없습니다")
     return place
@@ -329,6 +370,7 @@ def _note_out(db: Session, row: PlaceNote, user: User) -> NoteOut:
         user_id=row.user_id,
         author_name=author.display_name if author else "탈퇴한 사용자",
         content=row.content,
+        visibility=row.visibility,
         is_mine=row.user_id == user.id,
         can_edit=row.user_id == user.id or _is_admin(user),
         created_at=row.created_at,
@@ -534,7 +576,12 @@ def list_place_notes(
     user: User = Depends(get_current_user),
 ) -> list[NoteOut]:
     _require_place(db, place_id)
-    rows = db.query(PlaceNote).filter(PlaceNote.place_id == place_id).order_by(PlaceNote.created_at, PlaceNote.id).all()
+    query = db.query(PlaceNote).filter(PlaceNote.place_id == place_id)
+    if not _is_admin(user):
+        query = query.filter(
+            or_(PlaceNote.visibility == "shared", PlaceNote.user_id == user.id)
+        )
+    rows = query.order_by(PlaceNote.created_at, PlaceNote.id).all()
     return [_note_out(db, row, user) for row in rows]
 
 
@@ -545,8 +592,13 @@ def create_place_note(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> NoteOut:
-    place = _require_place(db, place_id)
-    row = PlaceNote(place_id=place.id, user_id=user.id, content=body.content)
+    place = _require_place(db, place_id, lock=True)
+    row = PlaceNote(
+        place_id=place.id,
+        user_id=user.id,
+        content=body.content,
+        visibility=body.visibility,
+    )
     db.add(row)
     db.flush()
     record_place_change_event(
@@ -555,7 +607,7 @@ def create_place_note(
         actor_id=user.id,
         event_type="note_added",
         summary="장소 메모 추가",
-        metadata={"note_id": row.id},
+        metadata={"note_id": row.id, "visibility": row.visibility},
     )
     db.commit()
     db.refresh(row)
@@ -570,18 +622,33 @@ def update_place_note(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> NoteOut:
-    row = db.get(PlaceNote, note_id)
+    initial = db.get(PlaceNote, note_id)
+    if initial is None:
+        raise HTTPException(status_code=404, detail="메모를 찾을 수 없습니다")
+    place = _require_place(db, initial.place_id, lock=True)
+    row = db.query(PlaceNote).filter(
+        PlaceNote.id == note_id,
+        PlaceNote.place_id == place.id,
+    ).populate_existing().with_for_update().first()
     if row is None:
         raise HTTPException(status_code=404, detail="메모를 찾을 수 없습니다")
     _require_owner_or_admin(row.user_id, user)
-    row.content = body.content
+    before_visibility = row.visibility
+    if body.content is not None:
+        row.content = body.content
+    if body.visibility is not None:
+        row.visibility = body.visibility
     record_place_change_event(
         db,
         place_id=row.place_id,
         actor_id=user.id,
         event_type="note_updated",
         summary="장소 메모 수정",
-        metadata={"note_id": row.id},
+        metadata={
+            "note_id": row.id,
+            "before_visibility": before_visibility,
+            "visibility": row.visibility,
+        },
     )
     db.commit()
     db.refresh(row)
@@ -595,7 +662,14 @@ def delete_place_note(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> Response:
-    row = db.get(PlaceNote, note_id)
+    initial = db.get(PlaceNote, note_id)
+    if initial is None:
+        raise HTTPException(status_code=404, detail="메모를 찾을 수 없습니다")
+    place = _require_place(db, initial.place_id, lock=True)
+    row = db.query(PlaceNote).filter(
+        PlaceNote.id == note_id,
+        PlaceNote.place_id == place.id,
+    ).populate_existing().with_for_update().first()
     if row is None:
         raise HTTPException(status_code=404, detail="메모를 찾을 수 없습니다")
     _require_owner_or_admin(row.user_id, user)
@@ -630,7 +704,7 @@ def create_place_image(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> ImageOut:
-    place = _require_place(db, place_id)
+    place = _require_place(db, place_id, lock=True)
     max_order = db.query(func.max(PlaceImage.sort_order)).filter(PlaceImage.place_id == place.id).scalar()
     row = PlaceImage(
         place_id=place.id,
@@ -664,7 +738,14 @@ def update_place_image(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> ImageOut:
-    row = db.get(PlaceImage, image_id)
+    initial = db.get(PlaceImage, image_id)
+    if initial is None:
+        raise HTTPException(status_code=404, detail="이미지를 찾을 수 없습니다")
+    place = _require_place(db, initial.place_id, lock=True)
+    row = db.query(PlaceImage).filter(
+        PlaceImage.id == image_id,
+        PlaceImage.place_id == place.id,
+    ).populate_existing().with_for_update().first()
     if row is None:
         raise HTTPException(status_code=404, detail="이미지를 찾을 수 없습니다")
     _require_owner_or_admin(row.user_id, user)
@@ -696,7 +777,7 @@ def reorder_place_images(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> list[ImageOut]:
-    _require_place(db, place_id)
+    _require_place(db, place_id, lock=True)
     rows = db.query(PlaceImage).filter(PlaceImage.place_id == place_id).order_by(PlaceImage.sort_order, PlaceImage.id).all()
     by_id = {row.id: row for row in rows}
     if set(body.image_ids) != set(by_id):
@@ -727,10 +808,62 @@ def delete_place_image(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> Response:
-    row = db.get(PlaceImage, image_id)
+    initial = db.get(PlaceImage, image_id)
+    if initial is None:
+        raise HTTPException(status_code=404, detail="이미지를 찾을 수 없습니다")
+    place = _require_place(db, initial.place_id, lock=True)
+    row = db.query(PlaceImage).filter(
+        PlaceImage.id == image_id,
+        PlaceImage.place_id == place.id,
+    ).populate_existing().with_for_update().first()
     if row is None:
         raise HTTPException(status_code=404, detail="이미지를 찾을 수 없습니다")
     _require_owner_or_admin(row.user_id, user)
+    # A URL under the CDN is not sufficient proof that this application owns
+    # the object. Only the append-only completion event turns it into an S3
+    # deletion target; ordinary external URL images never reach S3 here.
+    upload_reference: dict | None = None
+    audit_candidates = db.query(PlaceChangeEvent).filter(
+        PlaceChangeEvent.event_type == "image_uploaded",
+        PlaceChangeEvent.metadata_json.contains(f'"image_id":{row.id}'),
+    ).order_by(PlaceChangeEvent.id.desc()).all()
+    for event in audit_candidates:
+        try:
+            metadata = json.loads(event.metadata_json or "{}")
+            if int(metadata.get("image_id")) != row.id or not metadata.get("s3_key"):
+                continue
+        except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
+            continue
+        upload_reference = metadata
+        break
+
+    deleted_s3_key = ""
+    if upload_reference is not None:
+        try:
+            deleted_s3_key = delete_recorded_upload_object(
+                image_url=row.image_url,
+                object_key=str(upload_reference["s3_key"]),
+                recorded_bucket=str(upload_reference.get("s3_bucket") or ""),
+                recorded_public_url=str(upload_reference.get("public_url") or ""),
+            )
+        except ManagedImageStorageNotConfigured as exc:
+            db.rollback()
+            raise HTTPException(
+                status_code=503,
+                detail="직접 업로드 이미지를 삭제할 저장소가 설정되지 않았습니다",
+            ) from exc
+        except ManagedImageDeleteError as exc:
+            db.rollback()
+            raise HTTPException(
+                status_code=502,
+                detail="저장소에서 이미지를 삭제하지 못해 기록을 보존했습니다",
+            ) from exc
+        except ManagedImageStorageError as exc:
+            db.rollback()
+            raise HTTPException(
+                status_code=409,
+                detail="직접 업로드 이미지의 저장소 정보를 안전하게 확인할 수 없습니다",
+            ) from exc
     record_place_change_event(
         db,
         place_id=row.place_id,
@@ -739,7 +872,11 @@ def delete_place_image(
         field_name="images",
         old_value=str(row.id),
         summary="장소 이미지 삭제",
-        metadata={"image_id": row.id},
+        metadata={
+            "image_id": row.id,
+            "s3_key": deleted_s3_key,
+            "s3_object_deleted": bool(deleted_s3_key),
+        },
     )
     db.delete(row)
     db.commit()
@@ -771,27 +908,41 @@ def rollback_place_event(
     db: Session = Depends(get_db),
     admin: User = Depends(get_admin_user),
 ) -> ChangeEventOut:
-    event = db.get(PlaceChangeEvent, event_id)
+    event = db.query(PlaceChangeEvent).filter(
+        PlaceChangeEvent.id == event_id
+    ).populate_existing().with_for_update().first()
     if event is None:
         raise HTTPException(status_code=404, detail="변경 이벤트를 찾을 수 없습니다")
     if event.event_type == "rollback":
         raise HTTPException(status_code=409, detail="롤백 이벤트는 다시 롤백할 수 없습니다")
     if db.query(PlaceChangeEvent.id).filter(PlaceChangeEvent.rollback_of_event_id == event.id).first():
         raise HTTPException(status_code=409, detail="이미 롤백된 변경 이벤트입니다")
-    place = db.get(Place, event.place_id)
+    place = db.query(Place).filter(Place.id == event.place_id).populate_existing().with_for_update().first()
     if place is None:
         raise HTTPException(status_code=409, detail="장소가 삭제되어 필드 롤백을 적용할 수 없습니다")
+    if place.merged_into_id is not None:
+        raise HTTPException(
+            status_code=409,
+            detail="병합된 원본 장소입니다. 병합을 먼저 취소한 뒤 롤백해 주세요",
+        )
     try:
         metadata = json.loads(event.metadata_json or "{}")
         before = metadata.get("before") if isinstance(metadata, dict) else None
+        after = metadata.get("after") if isinstance(metadata, dict) else None
         snapshot = PlaceRollbackSnapshot.model_validate(before)
+        after_snapshot = PlaceRollbackSnapshot.model_validate(after)
     except (json.JSONDecodeError, TypeError, ValidationError) as exc:
         raise HTTPException(status_code=422, detail="검증 가능한 이전 장소 스냅샷이 없습니다") from exc
     values = snapshot.model_dump(exclude_unset=True)
+    expected_current_values = after_snapshot.model_dump(exclude_unset=True)
+    if set(values) != set(expected_current_values):
+        raise HTTPException(status_code=422, detail="변경 전후 필드가 일치하지 않아 안전하게 롤백할 수 없습니다")
     if "region_id" in values and db.get(Region, values["region_id"]) is None:
         raise HTTPException(status_code=422, detail="복원 대상 권역을 찾을 수 없습니다")
     if isinstance(values.get("tags"), list):
         values["tags"] = ",".join(dict.fromkeys(values["tags"]))
+    if isinstance(expected_current_values.get("tags"), list):
+        expected_current_values["tags"] = ",".join(dict.fromkeys(expected_current_values["tags"]))
     target_region = db.get(Region, values.get("region_id", place.region_id))
     target_lat = values.get("lat", place.lat)
     target_lng = values.get("lng", place.lng)
@@ -801,8 +952,19 @@ def rollback_place_event(
     ):
         raise HTTPException(status_code=422, detail="이전 좌표가 복원 대상 권역의 지도 범위 밖입니다")
     current_values = {field: getattr(place, field) for field in values}
+    changed_after_event = [
+        field for field, expected in expected_current_values.items()
+        if current_values[field] != expected
+    ]
+    if changed_after_event:
+        raise HTTPException(
+            status_code=409,
+            detail="후속 수정이 있는 필드는 덮어쓰지 않았습니다: " + ", ".join(changed_after_event),
+        )
     for field, value in values.items():
         setattr(place, field, value)
+    if any(field.startswith("coordinate_") for field in values):
+        place.coordinate_verified_at = datetime.now(timezone.utc)
     rollback = record_place_change_event(
         db,
         place_id=place.id,
@@ -931,6 +1093,15 @@ def resolve_appeal(
     row.resolution = body.resolution
     row.resolved_by_id = admin.id
     row.resolved_at = datetime.now(timezone.utc)
+    notify_users(
+        db,
+        [row.user_id],
+        kind="appeal_resolved",
+        title="장소 변경 이의신청 처리 완료",
+        body=body.resolution,
+        place_id=row.place_id,
+        related_event_id=row.event_id,
+    )
     db.commit()
     db.refresh(row)
     return _appeal_out(db, row)

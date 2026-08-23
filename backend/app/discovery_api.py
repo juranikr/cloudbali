@@ -10,9 +10,14 @@ from app.discovery import (
     approve_candidate,
     create_discovery_run,
     execute_queued_discovery,
+    finalize_discovery_dispatch_failure,
     get_discovery_run,
     list_candidates,
     reject_candidate,
+)
+from app.discovery_workflow import (
+    discovery_workflow_enabled,
+    start_discovery_workflow,
 )
 from app.models import User
 from app.schemas import (
@@ -41,7 +46,24 @@ def admin_run_discovery(
             limit=body.limit,
             trigger="manual",
         )
-        background_tasks.add_task(execute_queued_discovery, queued.run.id)
+        if discovery_workflow_enabled():
+            try:
+                start_discovery_workflow(
+                    run_id=queued.run.id,
+                    region_id=body.region_id,
+                    limit=body.limit,
+                    trigger="manual",
+                )
+            except Exception as exc:
+                finalize_discovery_dispatch_failure(db, queued.run.id)
+                raise HTTPException(
+                    status_code=status.HTTP_502_BAD_GATEWAY,
+                    detail="장소 발굴 워크플로를 시작하지 못했습니다",
+                ) from exc
+        else:
+            # Local development remains dependency-free and executes after the
+            # HTTP response. Production receives the state-machine ARN via ECS.
+            background_tasks.add_task(execute_queued_discovery, queued.run.id)
         return queued
     except DiscoveryBusyError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc

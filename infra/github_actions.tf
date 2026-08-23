@@ -21,8 +21,7 @@ data "aws_iam_policy_document" "github_assume" {
       test     = "StringLike"
       variable = "token.actions.githubusercontent.com:sub"
       values = [
-        "repo:juranikr/cloudbali:*",
-        "repo:juranikr@*/cloudbali@*:*",
+        "repo:juranikr/cloudbali:ref:refs/heads/main",
       ]
     }
   }

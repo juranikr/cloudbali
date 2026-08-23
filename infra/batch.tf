@@ -32,6 +32,10 @@ resource "aws_ecs_task_definition" "batch" {
       }
     }
   }])
+
+  lifecycle {
+    create_before_destroy = true
+  }
 }
 
 resource "aws_iam_role" "events" {
@@ -61,6 +65,11 @@ resource "aws_iam_role_policy" "events" {
         Effect   = "Allow"
         Action   = ["iam:PassRole"]
         Resource = [aws_iam_role.execution.arn, aws_iam_role.task.arn]
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["states:StartExecution"]
+        Resource = [aws_sfn_state_machine.discovery.arn]
       }
     ]
   })
@@ -106,27 +115,24 @@ resource "aws_cloudwatch_event_rule" "discovery" {
 resource "aws_cloudwatch_event_target" "discovery" {
   rule      = aws_cloudwatch_event_rule.discovery.name
   target_id = "cloudbali-place-discovery"
-  arn       = data.aws_ecs_cluster.shared.arn
+  arn       = aws_sfn_state_machine.discovery.arn
   role_arn  = aws_iam_role.events.arn
   input = jsonencode({
-    containerOverrides = [{
-      name    = "batch"
-      command = ["python", "-m", "app.discovery", "--limit", "60"]
-    }]
+    run_id      = 0
+    region_id   = 0
+    limit       = 60
+    trigger     = "schedule"
+    worker_mode = var.discovery_worker_mode
   })
 
-  ecs_target {
-    task_count          = 1
-    task_definition_arn = aws_ecs_task_definition.batch.arn
-    launch_type         = "FARGATE"
-    platform_version    = "LATEST"
-
-    network_configuration {
-      subnets          = var.public_subnet_ids
-      security_groups  = [aws_security_group.ecs.id]
-      assign_public_ip = true
-    }
+  dead_letter_config {
+    arn = aws_sqs_queue.discovery_dlq.arn
   }
 
-  depends_on = [aws_iam_role_policy.events]
+  retry_policy {
+    maximum_event_age_in_seconds = 3600
+    maximum_retry_attempts       = 3
+  }
+
+  depends_on = [aws_iam_role_policy.events, aws_sqs_queue_policy.discovery_dlq]
 }

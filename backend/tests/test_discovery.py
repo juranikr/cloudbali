@@ -1,8 +1,11 @@
+import json
 import os
 import tempfile
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from unittest.mock import patch
 
+from sqlalchemy import event
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -15,8 +18,16 @@ from fastapi.testclient import TestClient
 
 from app.db import SessionLocal
 from app.main import app
-from app.discovery import _claim_discovery_run, create_discovery_run, get_discovery_run
-from app.models import BatchRun, DiscoveryCandidate, DiscoveryJob, DiscoveryScanState, Region
+from app.discovery import (
+    _claim_discovery_run,
+    _locked_active_places_by_region,
+    create_discovery_run,
+    get_discovery_run,
+    inactive_place_reason,
+    prepare_discovery_retry,
+    revalidate_candidate_lifecycle,
+)
+from app.models import BatchRun, DiscoveryCandidate, DiscoveryJob, DiscoveryScanState, Place, Region
 
 
 def _login(client: TestClient, email: str, password: str) -> dict[str, str]:
@@ -142,6 +153,37 @@ def test_admin_discovery_requires_review_and_keeps_decision_history() -> None:
         assert rejected.json()["decision_history"][-1]["action"] == "rejected"
 
 
+def test_discovery_locks_multi_region_places_with_one_global_id_query() -> None:
+    with TestClient(app):
+        with SessionLocal() as db:
+            regions = db.query(Region).order_by(Region.id).limit(2).all()
+            assert len(regions) == 2
+            lock_statements: list[str] = []
+
+            def record_lock(execute_state) -> None:
+                statement = execute_state.statement
+                if getattr(statement, "_for_update_arg", None) is None:
+                    return
+                descriptions = getattr(statement, "column_descriptions", [])
+                entity = descriptions[0].get("entity") if descriptions else None
+                if entity is Place:
+                    lock_statements.append(str(statement))
+
+            event.listen(db, "do_orm_execute", record_lock)
+            try:
+                grouped = _locked_active_places_by_region(
+                    db,
+                    [regions[1].id, regions[0].id],
+                )
+            finally:
+                event.remove(db, "do_orm_execute", record_lock)
+
+            assert set(grouped) == {regions[0].id, regions[1].id}
+            assert len(lock_statements) == 1
+            assert "ORDER BY places.id" in lock_statements[0]
+            assert "FOR UPDATE" in lock_statements[0]
+
+
 def test_discovery_persists_an_expanding_scan_window() -> None:
     requested: list[tuple[int, int]] = []
 
@@ -179,6 +221,261 @@ def test_discovery_persists_an_expanding_scan_window() -> None:
             _completed_run(client, admin, second)
 
     assert requested[:2] == [(20, 0), (40, 0)]
+
+
+def test_discovery_excludes_explicitly_closed_osm_candidate() -> None:
+    with TestClient(app) as client:
+        admin = _login(client, "joohan92@naver.com", "admin-test-password")
+        regions = client.get("/api/regions", headers=admin).json()
+        ubud_id = next(item["id"] for item in regions if item["slug"] == "ubud")
+        closed = _osm_element(
+            801_234_567,
+            title="Permanently Closed Museum",
+            lat=-8.51,
+            lng=115.27,
+        )
+        closed["tags"]["opening_hours"] = "closed"
+
+        with patch("app.discovery.fetch_osm_elements", return_value=[closed]):
+            queued = client.post(
+                "/api/admin/discovery/run",
+                headers=admin,
+                json={"region_id": ubud_id, "limit": 1},
+            )
+        completed = _completed_run(client, admin, queued)
+
+        assert completed["created_count"] == 0
+        assert completed["invalid_count"] == 1
+        candidates = client.get(
+            "/api/admin/discovery/candidates",
+            headers=admin,
+            params={"region_id": ubud_id, "limit": 200},
+        ).json()
+        assert all(item["external_id"] != "node/801234567" for item in candidates)
+
+
+def test_inactive_lifecycle_parser_blocks_explicit_status_and_full_week_off() -> None:
+    assert inactive_place_reason({"status": "inactive"}) == "status=inactive"
+    assert inactive_place_reason({"operational_status": "non_operational"}) == "operational_status=non_operational"
+    assert inactive_place_reason({"opening_hours": "Mo-Su off"}) == "opening_hours=mo-su off"
+    assert inactive_place_reason({"opening_hours": "Mo-Fr 09:00-17:00; PH off"}) == ""
+
+
+def test_exact_osm_approval_revalidation_reads_current_lifecycle_tags() -> None:
+    payload = json.dumps({
+        "elements": [{
+            "type": "node",
+            "id": 801_234_568,
+            "tags": {"name": "Closed after discovery", "opening_hours": "Mo-Su off"},
+        }]
+    }).encode("utf-8")
+
+    class JsonResponse:
+        headers = {"Content-Type": "application/json; charset=utf-8"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, _limit: int) -> bytes:
+            return payload
+
+    candidate = SimpleNamespace(
+        source="openstreetmap",
+        external_id="node/801234568",
+        evidence="{}",
+    )
+    with patch("app.discovery.urlopen", return_value=JsonResponse()):
+        reason, evidence = revalidate_candidate_lifecycle(candidate)
+
+    assert reason == "opening_hours=mo-su off"
+    assert evidence["checks"][0]["active"] is False
+    assert evidence["checks"][0]["external_id"] == "node/801234568"
+
+
+def test_exact_osm_approval_revalidation_rejects_large_coordinate_drift() -> None:
+    payload = json.dumps({
+        "elements": [{
+            "type": "node",
+            "id": 801_234_580,
+            "lat": -8.40,
+            "lon": 115.40,
+            "tags": {"name": "Moved Garden", "tourism": "attraction"},
+        }]
+    }).encode("utf-8")
+
+    class JsonResponse:
+        headers = {"Content-Type": "application/json"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, _limit: int) -> bytes:
+            return payload
+
+    candidate = SimpleNamespace(
+        source="openstreetmap",
+        external_id="node/801234580",
+        evidence="{}",
+        lat=-8.52,
+        lng=115.28,
+    )
+    with patch("app.discovery.urlopen", return_value=JsonResponse()):
+        reason, evidence = revalidate_candidate_lifecycle(candidate)
+
+    assert "좌표" in reason
+    assert evidence["checks"][0]["active"] is False
+    assert evidence["checks"][0]["coordinate"]["verified"] is False
+
+
+def test_exact_wikidata_approval_revalidation_blocks_dissolved_entity() -> None:
+    payload = json.dumps({
+        "entities": {
+            "Q991001": {
+                "claims": {
+                    "P625": [{"mainsnak": {"datavalue": {"value": {"latitude": -8.5, "longitude": 115.2}}}}],
+                    "P576": [{"mainsnak": {"datavalue": {"value": {"time": "+2025-01-01T00:00:00Z"}}}}],
+                }
+            }
+        }
+    }).encode("utf-8")
+
+    class JsonResponse:
+        headers = {"Content-Type": "application/json"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, _limit: int) -> bytes:
+            return payload
+
+    candidate = SimpleNamespace(source="wikidata", external_id="Q991001", evidence="{}")
+    with patch("app.discovery.urlopen", return_value=JsonResponse()):
+        reason, evidence = revalidate_candidate_lifecycle(candidate)
+
+    assert "P576" in reason
+    assert evidence["checks"][0]["active"] is False
+
+
+def test_live_inactive_candidate_is_rejected_then_reactivated_when_source_reopens() -> None:
+    with TestClient(app) as client:
+        admin = _login(client, "joohan92@naver.com", "admin-test-password")
+        regions = client.get("/api/regions", headers=admin).json()
+        ubud_id = next(item["id"] for item in regions if item["slug"] == "ubud")
+        element = _osm_element(
+            801_234_569,
+            title="Lifecycle Reopen Garden",
+            lat=-8.565,
+            lng=115.345,
+        )
+        with patch("app.discovery.fetch_osm_elements", return_value=[element]):
+            queued = client.post(
+                "/api/admin/discovery/run", headers=admin,
+                json={"region_id": ubud_id, "limit": 1},
+            )
+        _completed_run(client, admin, queued)
+        candidates = client.get(
+            "/api/admin/discovery/candidates", headers=admin,
+            params={"region_id": ubud_id, "limit": 200},
+        ).json()
+        candidate = next(item for item in candidates if item["external_id"] == "node/801234569")
+        places_before = client.get("/api/admin/summary", headers=admin).json()["place_count"]
+
+        with patch(
+            "app.discovery.revalidate_candidate_lifecycle",
+            return_value=("status=inactive", {"checked_at": "2026-08-23T00:00:00+00:00", "checks": []}),
+        ):
+            blocked = client.post(
+                f"/api/admin/discovery/candidates/{candidate['id']}/approve",
+                headers=admin,
+                json={"note": "승인 전 원문 재확인"},
+            )
+        assert blocked.status_code == 409
+        rejected = client.get(
+            "/api/admin/discovery/candidates", headers=admin,
+            params={"status": "rejected", "region_id": ubud_id, "limit": 200},
+        ).json()
+        rejected_candidate = next(item for item in rejected if item["id"] == candidate["id"])
+        assert rejected_candidate["decision_history"][-1]["action"] == "approval_blocked_inactive"
+        assert client.get("/api/admin/summary", headers=admin).json()["place_count"] == places_before
+
+        with patch("app.discovery.fetch_osm_elements", return_value=[element]):
+            reopened_run = client.post(
+                "/api/admin/discovery/run", headers=admin,
+                json={"region_id": ubud_id, "limit": 1},
+            )
+        assert _completed_run(client, admin, reopened_run)["created_count"] == 1
+        pending = client.get(
+            "/api/admin/discovery/candidates", headers=admin,
+            params={"status": "pending", "region_id": ubud_id, "limit": 200},
+        ).json()
+        reopened = next(item for item in pending if item["id"] == candidate["id"])
+        assert reopened["decision_history"][-1]["action"] == "auto_reactivated"
+
+        with patch("app.discovery.revalidate_candidate_lifecycle", side_effect=TimeoutError("provider timeout")):
+            unavailable = client.post(
+                f"/api/admin/discovery/candidates/{candidate['id']}/approve",
+                headers=admin,
+                json={"note": "원문 재조회"},
+            )
+        assert unavailable.status_code == 409
+        still_pending = client.get(
+            "/api/admin/discovery/candidates", headers=admin,
+            params={"status": "pending", "region_id": ubud_id, "limit": 200},
+        ).json()
+        assert any(item["id"] == candidate["id"] for item in still_pending)
+
+
+def test_distinct_nearby_candidates_are_not_dropped_by_coordinates_alone() -> None:
+    with TestClient(app) as client:
+        admin = _login(client, "joohan92@naver.com", "admin-test-password")
+        regions = client.get("/api/regions", headers=admin).json()
+        ubud_id = next(item["id"] for item in regions if item["slug"] == "ubud")
+        first = _osm_element(801_234_570, title="North Courtyard Studio", lat=-8.57000, lng=115.35000)
+        second = _osm_element(801_234_571, title="South Courtyard Gallery", lat=-8.57002, lng=115.35002)
+        with patch("app.discovery.fetch_osm_elements", return_value=[first, second]):
+            queued = client.post(
+                "/api/admin/discovery/run", headers=admin,
+                json={"region_id": ubud_id, "limit": 2},
+            )
+        completed = _completed_run(client, admin, queued)
+        assert completed["created_count"] == 2
+        candidates = client.get(
+            "/api/admin/discovery/candidates", headers=admin,
+            params={"region_id": ubud_id, "limit": 200},
+        ).json()
+        external_ids = {item["external_id"] for item in candidates}
+        assert {"node/801234570", "node/801234571"}.issubset(external_ids)
+
+
+def test_same_name_nearby_provider_objects_remain_separate_review_candidates() -> None:
+    with TestClient(app) as client:
+        admin = _login(client, "joohan92@naver.com", "admin-test-password")
+        regions = client.get("/api/regions", headers=admin).json()
+        ubud_id = next(item["id"] for item in regions if item["slug"] == "ubud")
+        first = _osm_element(801_234_581, title="Kopi Branch", lat=-8.5600, lng=115.3300)
+        second = _osm_element(801_234_582, title="Kopi Branch", lat=-8.5592, lng=115.3300)
+        with patch("app.discovery.fetch_osm_elements", return_value=[first, second]):
+            queued = client.post(
+                "/api/admin/discovery/run", headers=admin,
+                json={"region_id": ubud_id, "limit": 2},
+            )
+        completed = _completed_run(client, admin, queued)
+        assert completed["created_count"] == 2
+        candidates = client.get(
+            "/api/admin/discovery/candidates", headers=admin,
+            params={"region_id": ubud_id, "limit": 200},
+        ).json()
+        external_ids = {item["external_id"] for item in candidates}
+        assert {"node/801234581", "node/801234582"}.issubset(external_ids)
 
 
 def test_unexpected_discovery_failure_is_finalized() -> None:
@@ -394,3 +691,68 @@ def test_stale_queued_discovery_run_is_finalized() -> None:
             replacement_run.finished_at = datetime.now(timezone.utc)
             replacement_job.active_slot = None
             db.commit()
+
+
+def test_workflow_retry_requeues_the_same_failed_run() -> None:
+    with TestClient(app):
+        with SessionLocal() as db:
+            region = db.query(Region).filter(Region.slug == "ubud").one()
+            queued = create_discovery_run(db, region_id=region.id, limit=3)
+            run = db.get(BatchRun, queued.run.id)
+            job = db.get(DiscoveryJob, queued.run.id)
+            assert run is not None and job is not None
+            run.status = "failed"
+            run.summary = "provider failed"
+            run.finished_at = datetime.now(timezone.utc)
+            job.active_slot = None
+            db.commit()
+
+            retried = prepare_discovery_retry(db, run.id)
+
+            assert retried.run.id == run.id
+            assert retried.run.status == "queued"
+            assert retried.run.finished_at is None
+            refreshed_job = db.get(DiscoveryJob, run.id)
+            assert refreshed_job is not None
+            assert refreshed_job.active_slot == "place_discovery"
+
+            run = db.get(BatchRun, run.id)
+            assert run is not None
+            run.status = "failed"
+            run.finished_at = datetime.now(timezone.utc)
+            refreshed_job.active_slot = None
+            db.commit()
+
+
+def test_manual_workflow_dispatch_failure_is_finalized_and_releases_lease() -> None:
+    with TestClient(app) as client:
+        admin = _login(client, "joohan92@naver.com", "admin-test-password")
+        regions = client.get("/api/regions", headers=admin).json()
+        ubud_id = next(item["id"] for item in regions if item["slug"] == "ubud")
+        with (
+            patch("app.discovery_api.discovery_workflow_enabled", return_value=True),
+            patch(
+                "app.discovery_api.start_discovery_workflow",
+                side_effect=RuntimeError("AWS unavailable"),
+            ),
+        ):
+            response = client.post(
+                "/api/admin/discovery/run",
+                headers=admin,
+                json={"region_id": ubud_id, "limit": 1},
+            )
+
+        assert response.status_code == 502
+        with SessionLocal() as db:
+            failed = (
+                db.query(BatchRun)
+                .filter(BatchRun.kind == "place_discovery", BatchRun.trigger == "manual")
+                .order_by(BatchRun.id.desc())
+                .first()
+            )
+            assert failed is not None
+            assert failed.status == "failed"
+            assert failed.finished_at is not None
+            job = db.get(DiscoveryJob, failed.id)
+            assert job is not None
+            assert job.active_slot is None

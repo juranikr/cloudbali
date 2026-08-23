@@ -4,6 +4,7 @@ export type PlaceNote = {
   user_id: number;
   author_name: string;
   content: string;
+  visibility: "shared" | "private";
   is_mine: boolean;
   can_edit: boolean;
   created_at: string;
@@ -70,4 +71,62 @@ export type AppealDraft = {
   event_id: number;
   reason: string;
   detail: string;
+};
+
+export type PlaceContributor = {
+  id: number | null;
+  user_id: number;
+  email: string;
+  display_name: string;
+  role: "owner" | "editor";
+  created_at: string | null;
+};
+
+export type PlaceInsight = {
+  id: number;
+  place_id: number;
+  kind: "location" | "history" | "visit" | "tip";
+  title: string;
+  content: string;
+  year_label: string;
+  source_url: string;
+  source_title: string;
+  confidence: number;
+  sort_order: number;
+  created_by_id: number | null;
+  verified_at: string | null;
+  can_edit: boolean;
+  created_at: string;
+  updated_at: string;
+};
+
+export type PlaceInsightDraft = {
+  kind: PlaceInsight["kind"];
+  title: string;
+  content: string;
+  year_label: string;
+  source_url: string;
+  source_title: string;
+  confidence: number;
+};
+
+export type PlaceChain = {
+  id: number;
+  name_local: string;
+  name_ko: string;
+  category: string;
+  aliases: string[];
+  description: string;
+  branch_count: number;
+  created_at: string;
+  updated_at: string;
+};
+
+export type UploadPresign = {
+  upload_url: string;
+  method: "PUT";
+  headers: Record<string, string>;
+  s3_key: string;
+  public_url: string;
+  expires_in: number;
 };

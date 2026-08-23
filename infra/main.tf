@@ -211,10 +211,16 @@ resource "aws_ecs_task_definition" "app" {
     }]
     environment = [
       { name = "APP_NAME", value = var.app_name },
-      { name = "ADMIN_EMAILS", value = "joohan92@naver.com" },
+      { name = "AWS_REGION", value = var.aws_region },
+      { name = "ADMIN_EMAILS", value = "joohan92@naver.com,tjwjd629@naver.com" },
       { name = "SEED_TEST_ACCOUNT", value = "false" },
       { name = "CORS_ORIGINS", value = format("https://%s", aws_cloudfront_distribution.app.domain_name) },
       { name = "GEOCODER_USER_AGENT", value = "cloudbali-production/1.0" },
+      { name = "S3_BUCKET", value = aws_s3_bucket.place_images.bucket },
+      { name = "S3_PUBLIC_BASE_URL", value = format("https://%s", aws_cloudfront_distribution.place_images.domain_name) },
+      { name = "DISCOVERY_STATE_MACHINE_ARN", value = aws_sfn_state_machine.discovery.arn },
+      { name = "DISCOVERY_WORKER_MODE", value = var.discovery_worker_mode },
+      { name = "CURATION_STATE_MACHINE_ARN", value = aws_sfn_state_machine.curation.arn },
     ]
     secrets = [
       { name = "DATABASE_URL", valueFrom = format("%s:DATABASE_URL::", data.aws_secretsmanager_secret.app.arn) },
@@ -240,6 +246,10 @@ resource "aws_ecs_task_definition" "app" {
       startPeriod = 20
     }
   }])
+
+  lifecycle {
+    create_before_destroy = true
+  }
 }
 
 resource "aws_ecs_service" "app" {
