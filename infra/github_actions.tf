@@ -22,6 +22,7 @@ data "aws_iam_policy_document" "github_assume" {
       variable = "token.actions.githubusercontent.com:sub"
       values = [
         "repo:juranikr/cloudbali:ref:refs/heads/main",
+        "repo:juranikr@295397696/cloudbali@1343501959:ref:refs/heads/main",
       ]
     }
   }
