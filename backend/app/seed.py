@@ -65,9 +65,6 @@ def seed_data(db: Session) -> None:
         user = db.query(User).filter(User.email == email).first()
         if user is None:
             db.add(User(email=email, display_name=display_name, password_hash=hash_password(password)))
-        else:
-            user.display_name = display_name
-            user.password_hash = hash_password(password)
 
     if db.query(Region.id).first() is None:
         db.add_all([Region(**item) for item in REGIONS])

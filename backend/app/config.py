@@ -24,7 +24,9 @@ class Settings(BaseSettings):
     seed_test_account: bool = True
     groq_api_key: str = ""
     groq_chat_model: str = "openai/gpt-oss-120b"
-    groq_timeout_seconds: float = 35.0
+    # Stay comfortably below CloudFront's 30-second origin timeout so a
+    # completed answer is never stored after the client already saw a 504.
+    groq_timeout_seconds: float = 24.0
 
     @property
     def cors_origin_list(self) -> list[str]:

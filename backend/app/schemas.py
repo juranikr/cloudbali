@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, model_validator
 
 
 class LoginRequest(BaseModel):
@@ -13,6 +13,7 @@ class UserOut(BaseModel):
     id: int
     email: str
     display_name: str
+    is_admin: bool = False
 
 
 class TokenOut(BaseModel):
@@ -79,6 +80,12 @@ class PlaceUpdate(BaseModel):
     traveler_note: str | None = Field(default=None, max_length=5000)
     tags: list[str] | None = None
 
+    @model_validator(mode="after")
+    def reject_explicit_nulls(self):
+        if any(getattr(self, field) is None for field in self.model_fields_set):
+            raise ValueError("장소 수정 값은 null일 수 없습니다")
+        return self
+
 
 class AdminPlaceUpdate(BaseModel):
     region_id: int | None = Field(default=None, gt=0)
@@ -100,6 +107,12 @@ class AdminPlaceUpdate(BaseModel):
     traveler_note: str | None = Field(default=None, max_length=5000)
     tags: list[str] | None = None
     source_url: str | None = Field(default=None, max_length=1000)
+
+    @model_validator(mode="after")
+    def reject_explicit_nulls(self):
+        if any(getattr(self, field) is None for field in self.model_fields_set):
+            raise ValueError("장소 수정 값은 null일 수 없습니다")
+        return self
 
 
 class AdminUserOut(BaseModel):
@@ -213,6 +226,7 @@ class RegionSnapshotOut(BaseModel):
     summary: str
     source_url: str
     observed_at: datetime
+    is_stale: bool = False
 
 
 class BatchRunOut(BaseModel):
@@ -226,3 +240,64 @@ class BatchRunOut(BaseModel):
     summary: str
     started_at: datetime
     finished_at: datetime | None
+
+
+class DiscoveryRunRequest(BaseModel):
+    region_id: int | None = Field(default=None, gt=0)
+    limit: int = Field(default=80, ge=1, le=200)
+
+
+class DiscoveryDecisionRequest(BaseModel):
+    note: str = Field(default="", max_length=2000)
+
+
+class DiscoveryApproveRequest(DiscoveryDecisionRequest):
+    force: bool = False
+
+
+class DiscoveryDecisionOut(BaseModel):
+    id: int
+    action: str
+    from_status: str
+    to_status: str
+    note: str
+    place_id: int | None
+    admin_email: str | None
+    created_at: datetime
+
+
+class DiscoveryCandidateOut(BaseModel):
+    id: int
+    discovery_run_id: int
+    region_id: int
+    region_name: str
+    island: str
+    source: str
+    external_id: str
+    source_url: str
+    title: str
+    local_name: str
+    description: str
+    area: str
+    category: str
+    lat: float
+    lng: float
+    confidence: float
+    evidence: str
+    tags: list[str]
+    status: str
+    duplicate_place_id: int | None
+    result_place_id: int | None
+    decision_note: str
+    decided_by_email: str | None
+    decided_at: datetime | None
+    decision_history: list[DiscoveryDecisionOut]
+    created_at: datetime
+    updated_at: datetime
+
+
+class DiscoveryRunOut(BaseModel):
+    run: BatchRunOut
+    created_count: int
+    duplicate_count: int
+    invalid_count: int

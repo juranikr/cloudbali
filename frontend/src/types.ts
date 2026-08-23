@@ -2,6 +2,7 @@ export type User = {
   id: number;
   email: string;
   display_name: string;
+  is_admin: boolean;
 };
 
 export type Region = {
@@ -96,7 +97,10 @@ export type AdminUser = User & {
   place_count: number;
   favorite_count: number;
   trip_stop_count: number;
-  is_admin: boolean;
+  owned_plan_count: number;
+  note_count: number;
+  image_count: number;
+  appeal_count: number;
   created_at: string;
 };
 
@@ -127,16 +131,78 @@ export type RegionSnapshot = {
   summary: string;
   source_url: string;
   observed_at: string;
+  is_stale: boolean;
 };
 
 export type BatchRun = {
   id: number;
   kind: string;
-  status: "running" | "success" | "partial" | "failed";
-  trigger: "schedule" | "manual";
+  status: "queued" | "running" | "success" | "partial" | "failed";
+  trigger: "schedule" | "manual" | "cli";
   scanned_count: number;
   updated_count: number;
   summary: string;
   started_at: string;
   finished_at: string | null;
+};
+
+export type DiscoveryCandidate = {
+  id: number;
+  region_id: number;
+  region_name: string;
+  title: string;
+  local_name: string;
+  category: string;
+  lat: number;
+  lng: number;
+  source: string;
+  source_url: string;
+  evidence: string;
+  confidence: number;
+  status: "pending" | "duplicate" | "approved" | "rejected";
+  duplicate_place_id: number | null;
+  result_place_id: number | null;
+  created_at: string;
+  decided_at: string | null;
+  decision_history?: unknown[];
+};
+
+export type DiscoveryRunResult = {
+  run: BatchRun;
+  created_count: number;
+  duplicate_count: number;
+  invalid_count: number;
+};
+
+export type PlaceChangeEvent = {
+  id: number;
+  place_id: number | null;
+  actor_id: number | null;
+  rollback_of_event_id: number | null;
+  actor_name: string;
+  event_type: string;
+  field_name: string;
+  old_value: string;
+  new_value: string;
+  summary: string;
+  metadata: Record<string, unknown>;
+  created_at: string;
+};
+
+export type PlaceAppeal = {
+  id: number;
+  event_id: number;
+  place_id: number | null;
+  place_title: string;
+  user_id: number;
+  user_name: string;
+  reason: string;
+  detail: string;
+  status: "open" | "resolved" | "dismissed";
+  resolution: string;
+  resolved_by_id: number | null;
+  resolved_by_name: string;
+  resolved_at: string | null;
+  created_at: string;
+  updated_at: string;
 };

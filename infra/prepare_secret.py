@@ -31,6 +31,8 @@ payload = json.dumps(
         "JWT_SECRET": secrets.token_urlsafe(64),
         "SEED_PASSWORD_JOOHAN": source["SEED_PASSWORD_JOOHAN"],
         "SEED_PASSWORD_GUKSEO": source["SEED_PASSWORD_GUKSEO"],
+        "GROQ_API_KEY": source.get("GROQ_API_KEY", ""),
+        "GROQ_CHAT_MODEL": source.get("GROQ_CHAT_MODEL", "openai/gpt-oss-120b"),
     },
     ensure_ascii=False,
 )

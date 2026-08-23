@@ -1,4 +1,4 @@
-import type { AdminSummary, AdminUser, BatchRun, ChatMessage, ChatResponse, Place, Region, RegionSnapshot, SearchHit, TokenResponse, TripStop, User } from "./types";
+import type { AdminSummary, AdminUser, BatchRun, ChatMessage, ChatResponse, DiscoveryCandidate, DiscoveryRunResult, Place, PlaceAppeal, PlaceChangeEvent, Region, RegionSnapshot, SearchHit, TokenResponse, TripStop, User } from "./types";
 
 const API_BASE = import.meta.env.VITE_API_URL || "";
 
@@ -135,6 +135,25 @@ export function adminUsers(token: string): Promise<AdminUser[]> {
   return request("/api/admin/users", token);
 }
 
+export function adminCreateUser(
+  token: string,
+  body: { email: string; display_name: string; password: string },
+): Promise<AdminUser> {
+  return request("/api/admin/users", token, { method: "POST", body: JSON.stringify(body) });
+}
+
+export function adminUpdateUser(
+  token: string,
+  userId: number,
+  body: { display_name?: string; password?: string },
+): Promise<AdminUser> {
+  return request("/api/admin/users/" + userId, token, { method: "PATCH", body: JSON.stringify(body) });
+}
+
+export function adminDeleteUser(token: string, userId: number): Promise<void> {
+  return request("/api/admin/users/" + userId, token, { method: "DELETE" });
+}
+
 export function adminPlaces(token: string, options: { q?: string; regionId?: number } = {}): Promise<Place[]> {
   const query = new URLSearchParams();
   if (options.q) query.set("q", options.q);
@@ -160,4 +179,85 @@ export function adminBatchRuns(token: string): Promise<BatchRun[]> {
 
 export function adminRunBatch(token: string): Promise<BatchRun> {
   return request("/api/admin/batch/run", token, { method: "POST" });
+}
+
+export function adminDiscoveryCandidates(
+  token: string,
+  options: { status?: string; regionId?: number; limit?: number } = {},
+): Promise<DiscoveryCandidate[]> {
+  const query = new URLSearchParams({ status: options.status || "pending" });
+  if (options.regionId) query.set("region_id", String(options.regionId));
+  if (options.limit) query.set("limit", String(options.limit));
+  return request("/api/admin/discovery/candidates?" + query.toString(), token);
+}
+
+export async function adminDiscoveryReviewCandidates(
+  token: string,
+  options: { regionId?: number; limit?: number } = {},
+): Promise<DiscoveryCandidate[]> {
+  const [pending, duplicates] = await Promise.all([
+    adminDiscoveryCandidates(token, { ...options, status: "pending" }),
+    adminDiscoveryCandidates(token, { ...options, status: "duplicate" }),
+  ]);
+  return [...pending, ...duplicates].sort((left, right) => right.id - left.id);
+}
+
+export function adminRunDiscovery(
+  token: string,
+  body: { region_id?: number; limit?: number },
+): Promise<DiscoveryRunResult> {
+  return request("/api/admin/discovery/run", token, { method: "POST", body: JSON.stringify(body) });
+}
+
+export function adminDiscoveryRun(token: string, runId: number): Promise<DiscoveryRunResult> {
+  return request("/api/admin/discovery/runs/" + runId, token);
+}
+
+export function adminApproveDiscoveryCandidate(
+  token: string,
+  candidateId: number,
+  note?: string,
+  force = false,
+): Promise<DiscoveryCandidate> {
+  return request("/api/admin/discovery/candidates/" + candidateId + "/approve", token, {
+    method: "POST",
+    body: JSON.stringify({ ...(note ? { note } : {}), ...(force ? { force: true } : {}) }),
+  });
+}
+
+export function adminRejectDiscoveryCandidate(token: string, candidateId: number, note?: string): Promise<DiscoveryCandidate> {
+  return request("/api/admin/discovery/candidates/" + candidateId + "/reject", token, {
+    method: "POST",
+    body: JSON.stringify(note ? { note } : {}),
+  });
+}
+
+export function adminAppeals(
+  token: string,
+  options: { status?: "all" | "open" | "resolved" | "dismissed"; placeId?: number; limit?: number } = {},
+): Promise<PlaceAppeal[]> {
+  const query = new URLSearchParams({ status: options.status || "open" });
+  if (options.placeId) query.set("place_id", String(options.placeId));
+  if (options.limit) query.set("limit", String(options.limit));
+  return request("/api/admin/appeals?" + query.toString(), token);
+}
+
+export function placeChangeEvents(token: string, placeId: number, limit = 100): Promise<PlaceChangeEvent[]> {
+  const query = new URLSearchParams({ limit: String(limit) });
+  return request("/api/places/" + placeId + "/events?" + query.toString(), token);
+}
+
+export function adminResolveAppeal(
+  token: string,
+  appealId: number,
+  body: { status: "resolved" | "dismissed"; resolution: string },
+): Promise<PlaceAppeal> {
+  return request("/api/admin/appeals/" + appealId + "/resolve", token, {
+    method: "PATCH",
+    body: JSON.stringify(body),
+  });
+}
+
+export function adminRollbackPlaceEvent(token: string, eventId: number): Promise<PlaceChangeEvent> {
+  return request("/api/admin/place-events/" + eventId + "/rollback", token, { method: "POST" });
 }

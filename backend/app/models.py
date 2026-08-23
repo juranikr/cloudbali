@@ -169,3 +169,137 @@ class BatchRun(Base):
     summary: Mapped[str] = mapped_column(Text, default="")
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class DiscoveryJob(Base):
+    """Durable parameters and counters for an asynchronous discovery run."""
+
+    __tablename__ = "discovery_jobs"
+    __table_args__ = (
+        UniqueConstraint("active_slot", name="uq_discovery_job_active_slot"),
+    )
+
+    batch_run_id: Mapped[int] = mapped_column(
+        ForeignKey("batch_runs.id", ondelete="CASCADE"), primary_key=True
+    )
+    region_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("regions.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    # Only the currently queued/running job owns this global value. SQL's
+    # nullable unique semantics retain every terminal job while preventing two
+    # workers (HTTP, CLI, or scheduler) from starting discovery concurrently.
+    active_slot: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)
+    requested_limit: Mapped[int] = mapped_column(Integer)
+    duplicate_count: Mapped[int] = mapped_column(Integer, default=0)
+    invalid_count: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    batch_run: Mapped[BatchRun] = relationship()
+    region: Mapped[Optional[Region]] = relationship()
+
+
+class DiscoveryScanState(Base):
+    """Persistent expanding OSM window for one discovery source and region."""
+
+    __tablename__ = "discovery_scan_states"
+    __table_args__ = (
+        UniqueConstraint("source", "region_id", name="uq_discovery_scan_source_region"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    source: Mapped[str] = mapped_column(String(40), default="openstreetmap", index=True)
+    region_id: Mapped[int] = mapped_column(
+        ForeignKey("regions.id", ondelete="CASCADE"), index=True
+    )
+    query_phase: Mapped[int] = mapped_column(Integer, default=0)
+    fetch_limit: Mapped[int] = mapped_column(Integer, default=0)
+    scan_count: Mapped[int] = mapped_column(Integer, default=0)
+    last_result_count: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    region: Mapped[Region] = relationship()
+
+
+class DiscoveryCandidate(Base):
+    """A sourced place candidate that is never public until an admin approves it."""
+
+    __tablename__ = "discovery_candidates"
+    __table_args__ = (
+        UniqueConstraint("source", "external_id", name="uq_discovery_candidate_source_external"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    discovery_run_id: Mapped[int] = mapped_column(
+        ForeignKey("batch_runs.id", ondelete="CASCADE"), index=True
+    )
+    region_id: Mapped[int] = mapped_column(ForeignKey("regions.id", ondelete="RESTRICT"), index=True)
+    source: Mapped[str] = mapped_column(String(40), default="openstreetmap", index=True)
+    external_id: Mapped[str] = mapped_column(String(120))
+    source_url: Mapped[str] = mapped_column(String(1000), default="")
+    title: Mapped[str] = mapped_column(String(180))
+    local_name: Mapped[str] = mapped_column(String(180), default="")
+    description: Mapped[str] = mapped_column(Text, default="")
+    area: Mapped[str] = mapped_column(String(100), default="")
+    category: Mapped[str] = mapped_column(String(30), index=True)
+    lat: Mapped[float] = mapped_column(Float)
+    lng: Mapped[float] = mapped_column(Float)
+    confidence: Mapped[float] = mapped_column(Float, default=0.5)
+    evidence: Mapped[str] = mapped_column(Text, default="{}")
+    tags: Mapped[str] = mapped_column(Text, default="")
+    status: Mapped[str] = mapped_column(String(20), default="pending", index=True)
+    duplicate_place_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("places.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    result_place_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("places.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    decision_note: Mapped[str] = mapped_column(Text, default="")
+    decided_by_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    decided_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    discovery_run: Mapped[BatchRun] = relationship()
+    region: Mapped[Region] = relationship()
+    duplicate_place: Mapped[Optional[Place]] = relationship(foreign_keys=[duplicate_place_id])
+    result_place: Mapped[Optional[Place]] = relationship(foreign_keys=[result_place_id])
+    decided_by: Mapped[Optional[User]] = relationship(foreign_keys=[decided_by_id])
+    decisions: Mapped[list["DiscoveryDecision"]] = relationship(
+        back_populates="candidate", cascade="all, delete-orphan", order_by="DiscoveryDecision.id"
+    )
+
+
+class DiscoveryDecision(Base):
+    """Append-only approval trail for a discovery candidate."""
+
+    __tablename__ = "discovery_decisions"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    candidate_id: Mapped[int] = mapped_column(
+        ForeignKey("discovery_candidates.id", ondelete="CASCADE"), index=True
+    )
+    admin_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    action: Mapped[str] = mapped_column(String(30), index=True)
+    from_status: Mapped[str] = mapped_column(String(20), default="")
+    to_status: Mapped[str] = mapped_column(String(20))
+    note: Mapped[str] = mapped_column(Text, default="")
+    place_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("places.id", ondelete="SET NULL"), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    candidate: Mapped[DiscoveryCandidate] = relationship(back_populates="decisions")
+    admin: Mapped[Optional[User]] = relationship(foreign_keys=[admin_id])
+    place: Mapped[Optional[Place]] = relationship(foreign_keys=[place_id])

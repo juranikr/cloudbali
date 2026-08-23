@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from pathlib import Path
 from urllib.parse import urlencode
@@ -11,12 +12,17 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import func, or_
+from sqlalchemy import func, or_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, joinedload
 
 from app.auth import create_access_token, get_admin_user, get_current_user, verify_password
 from app.config import settings
 from app.db import Base, SessionLocal, engine, get_db
+from app.discovery_api import router as discovery_router
+from app.itinerary_api import router as itinerary_router
+from app.itinerary_models import TravelPlanItem
+from app.operations_api import record_place_change_event, router as operations_router
 from app.batch import run_batch
 from app.models import BatchRun, ChatMessage, Favorite, Place, Region, RegionSnapshot, TripStop, User
 from app.schemas import (
@@ -60,6 +66,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.include_router(discovery_router)
+app.include_router(operations_router)
+app.include_router(itinerary_router)
 
 
 def tags_out(value: str) -> list[str]:
@@ -98,6 +107,67 @@ def place_out(place: Place, favorite_ids: set[int]) -> PlaceOut:
     )
 
 
+def user_out(user: User) -> UserOut:
+    return UserOut(
+        id=user.id,
+        email=user.email,
+        display_name=user.display_name,
+        is_admin=user.email.lower() in settings.admin_email_list,
+    )
+
+
+def apply_place_update_with_audit(
+    db: Session,
+    *,
+    place: Place,
+    actor_id: int,
+    values: dict,
+    summary: str,
+) -> list[str]:
+    """Apply changed Place fields and keep a validated rollback snapshot."""
+
+    before = {key: getattr(place, key) for key, value in values.items() if getattr(place, key) != value}
+    if not before:
+        return []
+    after = {key: values[key] for key in before}
+    for key, value in after.items():
+        setattr(place, key, value)
+    changed = list(before)
+    record_place_change_event(
+        db,
+        place_id=place.id,
+        actor_id=actor_id,
+        event_type="place_updated",
+        field_name=",".join(changed),
+        old_value=json.dumps(before, ensure_ascii=False),
+        new_value=json.dumps(after, ensure_ascii=False),
+        summary=summary,
+        metadata={"before": before, "after": after},
+    )
+    return changed
+
+
+def record_place_deletion(db: Session, *, place: Place, actor_id: int, summary: str) -> None:
+    record_place_change_event(
+        db,
+        place_id=place.id,
+        actor_id=actor_id,
+        event_type="place_deleted",
+        summary=summary,
+        metadata={
+            "deleted_place": {
+                "id": place.id,
+                "region_id": place.region_id,
+                "category": place.category,
+                "title": place.title,
+                "local_name": place.local_name,
+                "lat": place.lat,
+                "lng": place.lng,
+            }
+        },
+    )
+
+
 def user_favorite_ids(db: Session, user_id: int) -> set[int]:
     return {row[0] for row in db.query(Favorite.place_id).filter(Favorite.user_id == user_id).all()}
 
@@ -121,12 +191,12 @@ def login(body: LoginRequest, db: Session = Depends(get_db)) -> TokenOut:
     user = db.query(User).filter(User.email == body.email.lower()).first()
     if user is None or not verify_password(body.password, user.password_hash):
         raise HTTPException(status_code=401, detail="이메일 또는 비밀번호가 올바르지 않습니다")
-    return TokenOut(access_token=create_access_token(user.id), user=UserOut.model_validate(user))
+    return TokenOut(access_token=create_access_token(user.id), user=user_out(user))
 
 
 @app.get("/api/auth/me", response_model=UserOut)
 def me(user: User = Depends(get_current_user)) -> UserOut:
-    return UserOut.model_validate(user)
+    return user_out(user)
 
 
 @app.get("/api/regions", response_model=list[RegionOut])
@@ -200,6 +270,15 @@ def create_place(
     values["tags"] = ",".join(dict.fromkeys(item.strip() for item in values["tags"] if item.strip()))
     row = Place(**values, creator_id=user.id, coordinate_crs="WGS84")
     db.add(row)
+    db.flush()
+    record_place_change_event(
+        db,
+        place_id=row.id,
+        actor_id=user.id,
+        event_type="place_created",
+        summary="사용자가 장소를 등록했습니다",
+        metadata={"source": "manual"},
+    )
     db.commit()
     return place_out(load_place(db, row.id), user_favorite_ids(db, user.id))
 
@@ -219,8 +298,13 @@ def update_place(
     values = body.model_dump(exclude_unset=True)
     if "tags" in values:
         values["tags"] = ",".join(dict.fromkeys(item.strip() for item in values["tags"] if item.strip()))
-    for key, value in values.items():
-        setattr(row, key, value)
+    apply_place_update_with_audit(
+        db,
+        place=row,
+        actor_id=user.id,
+        values=values,
+        summary="사용자가 장소 정보를 수정했습니다",
+    )
     db.commit()
     return place_out(load_place(db, row.id), user_favorite_ids(db, user.id))
 
@@ -236,8 +320,21 @@ def delete_place(
         raise HTTPException(status_code=404, detail="장소를 찾을 수 없습니다")
     if row.creator_id != user.id:
         raise HTTPException(status_code=403, detail="직접 추가한 장소만 삭제할 수 있습니다")
+    if db.query(TravelPlanItem.id).filter(TravelPlanItem.place_id == row.id).first():
+        raise HTTPException(
+            status_code=409,
+            detail="여행 일정에서 사용 중인 장소는 삭제할 수 없습니다. 먼저 일정에서 장소를 제거해 주세요",
+        )
+    record_place_deletion(db, place=row, actor_id=user.id, summary="사용자가 장소를 삭제했습니다")
     db.delete(row)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail="다른 여행 데이터에서 사용 중인 장소는 삭제할 수 없습니다",
+        ) from exc
     return Response(status_code=204)
 
 
@@ -406,10 +503,10 @@ def region_conditions(
     db: Session = Depends(get_db),
     _: User = Depends(get_current_user),
 ) -> list[RegionSnapshotOut]:
+    now = datetime.now(timezone.utc)
     latest_ids = (
-        db.query(func.max(RegionSnapshot.id))
+        select(func.max(RegionSnapshot.id))
         .group_by(RegionSnapshot.region_id)
-        .subquery()
     )
     rows = (
         db.query(RegionSnapshot)
@@ -418,8 +515,14 @@ def region_conditions(
         .order_by(RegionSnapshot.region_id)
         .all()
     )
-    return [
-        RegionSnapshotOut(
+    output: list[RegionSnapshotOut] = []
+    for row in rows:
+        observed_at = (
+            row.observed_at
+            if row.observed_at.tzinfo is not None
+            else row.observed_at.replace(tzinfo=timezone.utc)
+        )
+        output.append(RegionSnapshotOut(
             id=row.id,
             region_id=row.region_id,
             region_name=row.region.name_ko,
@@ -430,10 +533,10 @@ def region_conditions(
             weather_code=row.weather_code,
             summary=row.summary,
             source_url=row.source_url,
-            observed_at=row.observed_at,
-        )
-        for row in rows
-    ]
+            observed_at=observed_at,
+            is_stale=now - observed_at > timedelta(hours=12),
+        ))
+    return output
 
 
 @app.get("/api/admin/summary")
@@ -542,8 +645,21 @@ def admin_update_place(
         raise HTTPException(status_code=404, detail="권역을 찾을 수 없습니다")
     if "tags" in values:
         values["tags"] = ",".join(dict.fromkeys(item.strip() for item in values["tags"] if item.strip()))
-    for key, value in values.items():
-        setattr(row, key, value)
+    target_region = db.get(Region, values.get("region_id", row.region_id))
+    target_lat = values.get("lat", row.lat)
+    target_lng = values.get("lng", row.lng)
+    if target_region is None or not (
+        target_region.south <= target_lat <= target_region.north
+        and target_region.west <= target_lng <= target_region.east
+    ):
+        raise HTTPException(status_code=422, detail="선택한 권역의 지도 범위 밖입니다")
+    apply_place_update_with_audit(
+        db,
+        place=row,
+        actor_id=admin.id,
+        values=values,
+        summary="관리자가 장소 정보를 수정했습니다",
+    )
     db.commit()
     return place_out(load_place(db, row.id), user_favorite_ids(db, admin.id))
 
@@ -552,13 +668,26 @@ def admin_update_place(
 def admin_delete_place(
     place_id: int,
     db: Session = Depends(get_db),
-    _: User = Depends(get_admin_user),
+    admin: User = Depends(get_admin_user),
 ) -> Response:
     row = db.get(Place, place_id)
     if row is None:
         raise HTTPException(status_code=404, detail="장소를 찾을 수 없습니다")
+    if db.query(TravelPlanItem.id).filter(TravelPlanItem.place_id == row.id).first():
+        raise HTTPException(
+            status_code=409,
+            detail="여행 일정에서 사용 중인 장소는 삭제할 수 없습니다. 먼저 일정에서 장소를 제거해 주세요",
+        )
+    record_place_deletion(db, place=row, actor_id=admin.id, summary="관리자가 장소를 삭제했습니다")
     db.delete(row)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail="다른 여행 데이터에서 사용 중인 장소는 삭제할 수 없습니다",
+        ) from exc
     return Response(status_code=204)
 
 

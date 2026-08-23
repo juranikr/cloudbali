@@ -1,14 +1,36 @@
-import { FormEvent, useEffect, useMemo, useState } from "react";
+import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import L from "leaflet";
-import { MapContainer, Marker, TileLayer, Tooltip, useMap } from "react-leaflet";
+import { Circle, CircleMarker, MapContainer, Marker, TileLayer, Tooltip, useMap } from "react-leaflet";
 import * as api from "./api";
 import AdminPage from "./AdminPage";
 import ChatPanel from "./ChatPanel";
+import ItineraryPanel from "./ItineraryPanel";
+import PlaceCollaboration from "./PlaceCollaboration";
+import SharedItineraryPage from "./SharedItineraryPage";
 import { BRAND_KICKER, BRAND_NAME, BRAND_SEAL, BRAND_STORY } from "./brand";
 import type { Place, Region, RegionSnapshot, SearchHit, TripStop, User } from "./types";
 
 
 const TOKEN_KEY = "patra.access_token";
+const MAP_VIEW_KEY = "patra.map_view";
+const DEFAULT_MAP_VIEW = { lat: -8.55, lng: 115.55, zoom: 9, restored: false };
+
+
+function readStoredMapView() {
+  try {
+    const raw = window.localStorage.getItem(MAP_VIEW_KEY);
+    if (!raw) return DEFAULT_MAP_VIEW;
+    const value = JSON.parse(raw) as { lat?: unknown; lng?: unknown; zoom?: unknown };
+    const lat = Number(value.lat);
+    const lng = Number(value.lng);
+    const zoom = Number(value.zoom);
+    if (!Number.isFinite(lat) || !Number.isFinite(lng) || !Number.isFinite(zoom)) return DEFAULT_MAP_VIEW;
+    if (lat < -90 || lat > 90 || lng < -180 || lng > 180 || zoom < 2 || zoom > 19) return DEFAULT_MAP_VIEW;
+    return { lat, lng, zoom, restored: true };
+  } catch {
+    return DEFAULT_MAP_VIEW;
+  }
+}
 
 const CATEGORY_META: Record<string, { label: string; icon: string; color: string }> = {
   beach: { label: "해변", icon: "≈", color: "#168aad" },
@@ -91,20 +113,59 @@ function LoginScreen({ onLogin }: { onLogin: (token: string, user: User) => void
 }
 
 
-function MapViewport({ region, focus }: { region: Region | null; focus: { lat: number; lng: number } | null }) {
+function MapViewport({
+  region,
+  focus,
+  preserveInitialView,
+  initialRegionId
+}: {
+  region: Region | null;
+  focus: { lat: number; lng: number } | null;
+  preserveInitialView: boolean;
+  initialRegionId: number;
+}) {
   const map = useMap();
+  const firstUpdate = useRef(true);
+  const initialRegionHydrated = useRef(false);
   useEffect(() => {
     if (focus) {
       map.flyTo([focus.lat, focus.lng], 16, { duration: 0.6 });
     } else if (region) {
-      map.fitBounds([[region.south, region.west], [region.north, region.east]], { padding: [28, 28] });
-    } else {
+      const shouldKeepStoredView = preserveInitialView
+        && initialRegionId === region.id
+        && !initialRegionHydrated.current;
+      initialRegionHydrated.current = true;
+      if (!shouldKeepStoredView) {
+        map.fitBounds([[region.south, region.west], [region.north, region.east]], { padding: [28, 28] });
+      }
+    } else if (!firstUpdate.current || !preserveInitialView) {
       map.fitBounds([[-9.1, 114.35], [-8.0, 116.45]], { padding: [24, 24] });
     }
-  }, [map, region, focus]);
+    firstUpdate.current = false;
+  }, [map, region, focus, preserveInitialView, initialRegionId]);
   useEffect(() => {
     const timer = window.setTimeout(() => map.invalidateSize(), 100);
     return () => window.clearTimeout(timer);
+  }, [map]);
+  return null;
+}
+
+
+function MapViewPersistence() {
+  const map = useMap();
+  useEffect(() => {
+    const saveView = () => {
+      const center = map.getCenter();
+      window.localStorage.setItem(MAP_VIEW_KEY, JSON.stringify({
+        lat: Number(center.lat.toFixed(6)),
+        lng: Number(center.lng.toFixed(6)),
+        zoom: map.getZoom()
+      }));
+    };
+    map.on("moveend zoomend", saveView);
+    return () => {
+      map.off("moveend zoomend", saveView);
+    };
   }, [map]);
   return null;
 }
@@ -116,10 +177,308 @@ function markerIcon(category: string, selected: boolean) {
     className: "place-marker-wrap",
     html:
       '<span class="place-marker' + (selected ? " place-marker--selected" : "") +
-      '" style="--marker:' + meta.color + '">' + meta.icon + "</span>",
-    iconSize: [34, 42],
-    iconAnchor: [17, 38]
+      '" style="--marker:' + meta.color + '"><span class="place-marker__glyph" aria-hidden="true">' + meta.icon + "</span></span>",
+    iconSize: [48, 48],
+    iconAnchor: [24, 43],
+    tooltipAnchor: [0, -36]
   });
+}
+
+
+function clusterMarkerIcon(count: number, selected: boolean) {
+  return L.divIcon({
+    className: "place-cluster-wrap",
+    html:
+      '<span class="place-cluster' + (selected ? " place-cluster--selected" : "") +
+      '" role="img" aria-label="가까운 장소 ' + count + '곳"><strong>' + count + "</strong><small>곳</small></span>",
+    iconSize: [52, 52],
+    iconAnchor: [26, 26],
+    tooltipAnchor: [0, -24]
+  });
+}
+
+
+function PlaceMarkerLayer({
+  places,
+  selected,
+  onSelect
+}: {
+  places: Place[];
+  selected: Place | null;
+  onSelect: (place: Place) => void;
+}) {
+  const map = useMap();
+  const [viewportRevision, setViewportRevision] = useState(0);
+
+  useEffect(() => {
+    const refresh = () => setViewportRevision((revision) => revision + 1);
+    map.on("moveend zoomend resize", refresh);
+    return () => {
+      map.off("moveend zoomend resize", refresh);
+    };
+  }, [map]);
+
+  const groups = useMemo(() => {
+    const zoom = map.getZoom();
+    const visibleBounds = map.getBounds().pad(0.2);
+    const visiblePlaces = places.filter((place) => visibleBounds.contains([place.lat, place.lng]));
+    if (zoom >= 15) {
+      return visiblePlaces.map((place) => ({
+        places: [place],
+        point: map.project([place.lat, place.lng], zoom),
+        center: L.latLng(place.lat, place.lng)
+      }));
+    }
+
+    const radius = zoom <= 9 ? 58 : zoom <= 11 ? 52 : 46;
+    const working: Array<{ places: Place[]; point: L.Point }> = [];
+    for (const place of visiblePlaces) {
+      const point = map.project([place.lat, place.lng], zoom);
+      const nearby = working.find((group) => group.point.distanceTo(point) <= radius);
+      if (!nearby) {
+        working.push({ places: [place], point });
+        continue;
+      }
+      const previousCount = nearby.places.length;
+      nearby.point = L.point(
+        (nearby.point.x * previousCount + point.x) / (previousCount + 1),
+        (nearby.point.y * previousCount + point.y) / (previousCount + 1)
+      );
+      nearby.places.push(place);
+    }
+    return working.map((group) => ({ ...group, center: map.unproject(group.point, zoom) }));
+  }, [map, places, viewportRevision]);
+
+  function openCluster(clusterPlaces: Place[]) {
+    const bounds = L.latLngBounds(clusterPlaces.map((place) => [place.lat, place.lng] as [number, number]));
+    const nextZoom = Math.min(map.getZoom() + 2, 16);
+    if (bounds.getNorthEast().distanceTo(bounds.getSouthWest()) < 5) {
+      map.flyTo(bounds.getCenter(), nextZoom, { duration: 0.45 });
+      return;
+    }
+    map.fitBounds(bounds, { padding: [70, 70], maxZoom: nextZoom });
+  }
+
+  return (
+    <>
+      {groups.map((group) => {
+        if (group.places.length === 1) {
+          const place = group.places[0];
+          return (
+            <Marker
+              key={"place-" + place.id}
+              position={[place.lat, place.lng]}
+              icon={markerIcon(place.category, selected?.id === place.id)}
+              title={place.title}
+              keyboard
+              riseOnHover
+              eventHandlers={{ click: () => onSelect(place) }}
+            >
+              <Tooltip direction="top"><strong>{place.title}</strong><br /><small>{place.best_time}</small></Tooltip>
+            </Marker>
+          );
+        }
+        const containsSelected = group.places.some((place) => place.id === selected?.id);
+        const clusterId = group.places.map((place) => place.id).sort((a, b) => a - b).join("-");
+        return (
+          <Marker
+            key={"cluster-" + clusterId}
+            position={group.center}
+            icon={clusterMarkerIcon(group.places.length, containsSelected)}
+            title={"가까운 장소 " + group.places.length + "곳 · 눌러서 확대"}
+            keyboard
+            riseOnHover
+            zIndexOffset={250}
+            eventHandlers={{ click: () => openCluster(group.places) }}
+          >
+            <Tooltip className="place-cluster-tooltip" direction="top">
+              <strong>가까운 장소 {group.places.length}곳</strong>
+              <small>{group.places.slice(0, 4).map((place) => place.title).join(" · ")}{group.places.length > 4 ? " 외" : ""}</small>
+              <em>눌러서 자세히 보기</em>
+            </Tooltip>
+          </Marker>
+        );
+      })}
+    </>
+  );
+}
+
+
+function UserLocationControl() {
+  const map = useMap();
+  const [locating, setLocating] = useState(false);
+  const [message, setMessage] = useState("");
+  const [location, setLocation] = useState<{ lat: number; lng: number; accuracy: number } | null>(null);
+
+  function locateOnce() {
+    if (!window.isSecureContext) {
+      setMessage("내 위치는 HTTPS 접속에서 사용할 수 있어요.");
+      return;
+    }
+    if (!navigator.geolocation) {
+      setMessage("이 기기에서는 위치 찾기를 지원하지 않아요.");
+      return;
+    }
+    setLocating(true);
+    setMessage("현재 위치를 확인하는 중…");
+    navigator.geolocation.getCurrentPosition(
+      (position) => {
+        const nextLocation = {
+          lat: position.coords.latitude,
+          lng: position.coords.longitude,
+          accuracy: position.coords.accuracy
+        };
+        setLocation(nextLocation);
+        setLocating(false);
+        setMessage("정확도 약 " + Math.round(position.coords.accuracy) + "m");
+        map.flyTo([nextLocation.lat, nextLocation.lng], Math.max(map.getZoom(), 14), { duration: 0.7 });
+      },
+      (reason) => {
+        setLocating(false);
+        if (reason.code === reason.PERMISSION_DENIED) setMessage("브라우저에서 위치 권한을 허용해 주세요.");
+        else if (reason.code === reason.TIMEOUT) setMessage("위치 확인 시간이 초과됐어요. 다시 시도해 주세요.");
+        else setMessage("현재 위치를 확인하지 못했어요.");
+      },
+      { enableHighAccuracy: true, timeout: 12000, maximumAge: 60000 }
+    );
+  }
+
+  return (
+    <>
+      {location ? (
+        <>
+          <Circle
+            center={[location.lat, location.lng]}
+            radius={Math.min(Math.max(location.accuracy, 20), 5000)}
+            pathOptions={{ color: "#277bb5", weight: 1, opacity: 0.55, fillColor: "#4aa7df", fillOpacity: 0.12 }}
+            interactive={false}
+          />
+          <CircleMarker
+            center={[location.lat, location.lng]}
+            radius={8}
+            pathOptions={{ color: "#ffffff", weight: 3, fillColor: "#1976b9", fillOpacity: 1 }}
+          >
+            <Tooltip direction="top"><strong>내 위치</strong><br /><small>정확도 약 {Math.round(location.accuracy)}m</small></Tooltip>
+          </CircleMarker>
+        </>
+      ) : null}
+      <div className="location-control">
+        <button
+          type="button"
+          onClick={locateOnce}
+          onMouseDown={(event) => event.stopPropagation()}
+          onDoubleClick={(event) => event.stopPropagation()}
+          disabled={locating}
+          aria-label={locating ? "현재 위치를 확인하는 중" : "현재 위치를 한 번 확인하고 지도를 이동"}
+          title="내 위치로 한 번 이동"
+        >
+          <span aria-hidden="true">⌖</span>
+          <small>{locating ? "찾는 중" : "내 위치"}</small>
+        </button>
+        {message ? <span className="location-control__message" role="status">{message}</span> : null}
+      </div>
+    </>
+  );
+}
+
+
+function weatherMeta(code: number) {
+  if (code === 0) return { symbol: "☀", tone: "clear" };
+  if ([1, 2, 3].includes(code)) return { symbol: "☁", tone: "cloud" };
+  if ([45, 48].includes(code)) return { symbol: "≋", tone: "fog" };
+  if ((code >= 51 && code <= 67) || (code >= 80 && code <= 82)) return { symbol: "☂", tone: "rain" };
+  if ((code >= 71 && code <= 77) || [85, 86].includes(code)) return { symbol: "❄", tone: "rain" };
+  if (code >= 95) return { symbol: "⚡", tone: "storm" };
+  return { symbol: "☁", tone: "cloud" };
+}
+
+
+function escapeHtml(value: string) {
+  return value.replace(/[&<>'"]/g, (character) => ({
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    "'": "&#39;",
+    '"': "&quot;"
+  }[character] || character));
+}
+
+
+function weatherMarkerIcon(snapshot: RegionSnapshot, region: Region, selected: boolean) {
+  const meta = weatherMeta(snapshot.weather_code);
+  const temperature = Math.round(snapshot.temperature_c);
+  const freshness = snapshot.is_stale ? "마지막 관측" : "현재 날씨";
+  const accessibleLabel = escapeHtml(
+    region.name_ko + " " + freshness + ", " + temperature + "도, " + snapshot.summary +
+    (snapshot.is_stale ? ", 갱신 필요. " : ". ") + "눌러서 권역 선택"
+  );
+  return L.divIcon({
+    className: "weather-marker-wrap",
+    html:
+      '<span class="weather-marker weather-marker--' + meta.tone + (selected ? " weather-marker--selected" : "") +
+      (snapshot.is_stale ? " weather-marker--stale" : "") +
+      '" role="img" aria-label="' + accessibleLabel + '"><span class="weather-marker__symbol" aria-hidden="true">' +
+      meta.symbol + '</span><strong aria-hidden="true">' + temperature + "°</strong></span>",
+    iconSize: [74, 46],
+    iconAnchor: [37, 23],
+    tooltipAnchor: [0, -25]
+  });
+}
+
+
+function formatObservedAt(value: string) {
+  const observedAt = new Date(value);
+  if (Number.isNaN(observedAt.getTime())) return "최근 관측";
+  return new Intl.DateTimeFormat("ko-KR", {
+    timeZone: "Asia/Makassar",
+    month: "numeric",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit"
+  }).format(observedAt) + " 발리 시간";
+}
+
+
+function WeatherMarkerLayer({
+  items,
+  selectedRegionId,
+  onSelectRegion
+}: {
+  items: Array<{ region: Region; snapshot: RegionSnapshot }>;
+  selectedRegionId: number;
+  onSelectRegion: (regionId: number) => void;
+}) {
+  const map = useMap();
+  const [zoom, setZoom] = useState(map.getZoom());
+  useEffect(() => {
+    const updateZoom = () => setZoom(map.getZoom());
+    map.on("zoomend", updateZoom);
+    return () => { map.off("zoomend", updateZoom); };
+  }, [map]);
+
+  return (
+    <>
+      {items.filter(({ region }) => !(region.id === selectedRegionId && zoom >= 10)).map(({ region, snapshot }) => (
+        <Marker
+          key={"weather-" + region.id}
+          position={[region.center_lat, region.center_lng]}
+          icon={weatherMarkerIcon(snapshot, region, selectedRegionId === region.id)}
+          title={region.name_ko + " · " + Math.round(snapshot.temperature_c) + "° · " + snapshot.summary + (snapshot.is_stale ? " · 갱신 필요" : "")}
+          keyboard
+          riseOnHover
+          zIndexOffset={-500}
+          eventHandlers={{ click: () => onSelectRegion(region.id) }}
+        >
+          <Tooltip className="weather-tooltip" direction="top">
+            <strong>{region.name_ko} · {Math.round(snapshot.temperature_c)}°</strong>
+            <span>{weatherMeta(snapshot.weather_code).symbol} {snapshot.summary}</span>
+            <small>강수 {snapshot.precipitation_mm.toFixed(1)}mm · 바람 {Math.round(snapshot.wind_kph)}km/h</small>
+            <em>{snapshot.is_stale ? "갱신 필요 · " : ""}{formatObservedAt(snapshot.observed_at)} 기준</em>
+          </Tooltip>
+        </Marker>
+      ))}
+    </>
+  );
 }
 
 
@@ -138,13 +497,17 @@ function PlaceDetail({
   inTrip,
   onClose,
   onFavorite,
-  onTrip
+  onTrip,
+  onItinerary,
+  onCollaborate
 }: {
   place: Place;
   inTrip: boolean;
   onClose: () => void;
   onFavorite: () => void;
   onTrip: () => void;
+  onItinerary: () => void;
+  onCollaborate: () => void;
 }) {
   const meta = CATEGORY_META[place.category] || CATEGORY_META.other;
   const mapsUrl = "https://www.google.com/maps/search/?api=1&query=" + place.lat + "," + place.lng;
@@ -174,7 +537,9 @@ function PlaceDetail({
         <div className="tags">{place.tags.map((tag) => <span key={tag}>#{tag}</span>)}</div>
         <div className="place-detail__actions">
           <button type="button" onClick={onFavorite}>{place.is_favorite ? "♥ 저장됨" : "♡ 저장"}</button>
-          <button type="button" className="primary" onClick={onTrip} disabled={inTrip}>{inTrip ? "일정에 있음" : "DAY 1에 담기"}</button>
+          <button type="button" onClick={onTrip} disabled={inTrip}>{inTrip ? "빠른 DAY에 있음" : "빠른 DAY 1에 담기"}</button>
+          <button type="button" className="primary" onClick={onItinerary}>날짜 일정에 추가</button>
+          <button type="button" onClick={onCollaborate}>메모 · 사진 · 이력</button>
         </div>
         <a className="map-link" href={mapsUrl} target="_blank" rel="noreferrer">길찾기 앱에서 좌표 열기 ↗</a>
         <small className="data-note">{place.coordinate_crs} · {place.is_seed ? "시작 데이터, 여행 전 최신 정보 확인" : "내가 추가한 장소"}</small>
@@ -227,10 +592,12 @@ function TripPanel({
 
 export default function App() {
   const [token, setToken] = useState(() => window.localStorage.getItem(TOKEN_KEY) || "");
+  const [initialMapView] = useState(readStoredMapView);
   const [user, setUser] = useState<User | null>(null);
   const [authLoading, setAuthLoading] = useState(Boolean(token));
   const [regions, setRegions] = useState<Region[]>([]);
   const [selectedRegionId, setSelectedRegionId] = useState<number>(() => Number(window.localStorage.getItem("patra.region_id")) || 0);
+  const initialRegionId = useRef(selectedRegionId).current;
   const [places, setPlaces] = useState<Place[]>([]);
   const [selected, setSelected] = useState<Place | null>(null);
   const [categories, setCategories] = useState<string[]>([]);
@@ -238,6 +605,9 @@ export default function App() {
   const [favoritesOnly, setFavoritesOnly] = useState(false);
   const [trip, setTrip] = useState<TripStop[]>([]);
   const [tripOpen, setTripOpen] = useState(false);
+  const [itineraryOpen, setItineraryOpen] = useState(false);
+  const [itineraryPlaces, setItineraryPlaces] = useState<Place[]>([]);
+  const [collaborationOpen, setCollaborationOpen] = useState(false);
   const [chatOpen, setChatOpen] = useState(false);
   const [conditions, setConditions] = useState<RegionSnapshot[]>([]);
   const [query, setQuery] = useState("");
@@ -257,6 +627,14 @@ export default function App() {
     () => conditions.find((item) => item.region_id === selectedRegionId) || null,
     [conditions, selectedRegionId]
   );
+  const regionalConditions = useMemo(() => {
+    const conditionsByRegion = new Map(conditions.map((snapshot) => [snapshot.region_id, snapshot]));
+    return regions.reduce<Array<{ region: Region; snapshot: RegionSnapshot }>>((items, region) => {
+      const snapshot = conditionsByRegion.get(region.id);
+      if (snapshot) items.push({ region, snapshot });
+      return items;
+    }, []);
+  }, [conditions, regions]);
 
   useEffect(() => {
     document.title = BRAND_NAME + " · Island travel map";
@@ -275,16 +653,21 @@ export default function App() {
 
   useEffect(() => {
     if (!token || !user) return;
-    void Promise.all([api.regions(token), api.trip(token), api.conditions(token)])
-      .then(([nextRegions, nextTrip, nextConditions]) => {
-        setRegions(nextRegions);
-        setTrip(nextTrip);
-        setConditions(nextConditions);
-        if (!nextRegions.some((region) => region.id === selectedRegionId)) {
-          setSelectedRegionId(0);
+    void Promise.allSettled([api.regions(token), api.trip(token), api.conditions(token)])
+      .then(([regionResult, tripResult, conditionResult]) => {
+        if (regionResult.status === "fulfilled") {
+          setRegions(regionResult.value);
+          if (!regionResult.value.some((region) => region.id === selectedRegionId)) {
+            setSelectedRegionId(0);
+          }
         }
-      })
-      .catch((reason) => setError(reason instanceof Error ? reason.message : "여행 데이터를 불러오지 못했습니다"));
+        if (tripResult.status === "fulfilled") setTrip(tripResult.value);
+        if (conditionResult.status === "fulfilled") setConditions(conditionResult.value);
+        const failure = [regionResult, tripResult, conditionResult].find((result) => result.status === "rejected");
+        if (failure?.status === "rejected") {
+          setError(failure.reason instanceof Error ? failure.reason.message : "일부 여행 데이터를 불러오지 못했습니다");
+        }
+      });
   }, [token, user]);
 
   useEffect(() => {
@@ -416,13 +799,37 @@ export default function App() {
     setTrip((current) => current.filter((stop) => stop.id !== stopId));
   }
 
+  function openItinerary() {
+    setItineraryOpen(true);
+    setTripOpen(false);
+    setChatOpen(false);
+    setCollaborationOpen(false);
+    if (!itineraryPlaces.length && token) {
+      void api.places(token, {})
+        .then(setItineraryPlaces)
+        .catch((reason) => setError(reason instanceof Error ? reason.message : "전체 장소를 불러오지 못했습니다"));
+    }
+  }
+
+  const sharedItineraryPrefix = "/shared-itinerary/";
+  if (window.location.pathname.startsWith(sharedItineraryPrefix)) {
+    const rawToken = window.location.pathname.slice(sharedItineraryPrefix.length).split("/")[0];
+    let shareToken = rawToken;
+    try {
+      shareToken = decodeURIComponent(rawToken);
+    } catch {
+      // The public page displays a readable invalid-link error for malformed tokens.
+    }
+    return <SharedItineraryPage shareToken={shareToken} />;
+  }
+
   if (authLoading) {
     return <main className="splash"><Brand /><span>섬 지도를 준비하는 중…</span></main>;
   }
   if (!token || !user) {
     return <LoginScreen onLogin={onLogin} />;
   }
-  if ((window.location.pathname.replace(/\/+$/, "") || "/") === "/admin") {
+  if ((window.location.pathname.replace(/\/+$/, "") || "/") === "/admin" && user.is_admin) {
     return <AdminPage token={token} user={user} regions={regions} onBack={() => window.location.assign("/")} />;
   }
 
@@ -431,10 +838,11 @@ export default function App() {
       <header className="topbar">
         <Brand compact />
         <nav>
-          <button type="button" onClick={() => setFiltersOpen((value) => !value)}>탐색 조건 <span>{categories.length + (condition ? 1 : 0)}</span></button>
-          <button type="button" onClick={() => { setChatOpen(true); setTripOpen(false); }}>여행 도우미 <span>✦</span></button>
-          <button type="button" onClick={() => setTripOpen(true)}>나의 여행 <span>{trip.length}</span></button>
-          {user.email.toLowerCase() === "joohan92@naver.com" ? <button type="button" onClick={() => window.location.assign("/admin")}>관리자</button> : null}
+          <button type="button" aria-label="탐색 조건" onClick={() => setFiltersOpen((value) => !value)}><i aria-hidden="true">☷</i><b>탐색 조건</b><span>{categories.length + (condition ? 1 : 0)}</span></button>
+          <button type="button" aria-label="여행 도우미" onClick={() => { setChatOpen(true); setTripOpen(false); setItineraryOpen(false); setCollaborationOpen(false); }}><i aria-hidden="true">✦</i><b>여행 도우미</b><span>✦</span></button>
+          <button type="button" aria-label="여행 계획" onClick={openItinerary}><i aria-hidden="true">⌁</i><b>여행 계획</b><span>⌁</span></button>
+          <button type="button" aria-label="빠른 DAY" onClick={() => { setTripOpen(true); setItineraryOpen(false); setCollaborationOpen(false); }}><i aria-hidden="true">D</i><b>빠른 DAY</b><span>{trip.length}</span></button>
+          {user.is_admin ? <button type="button" aria-label="관리자" onClick={() => window.location.assign("/admin")}><i aria-hidden="true">⚙</i><b>관리자</b></button> : null}
         </nav>
         <div className="topbar__user"><span>{user.display_name}</span><button type="button" onClick={logout}>로그아웃</button></div>
       </header>
@@ -459,7 +867,7 @@ export default function App() {
           </section>
           <button className={"favorite-filter " + (favoritesOnly ? "active" : "")} type="button" onClick={() => setFavoritesOnly((value) => !value)}>♥ 저장한 장소만 보기</button>
           {(categories.length || condition || favoritesOnly) ? <button className="reset-filter" type="button" onClick={() => { setCategories([]); setCondition(""); setFavoritesOnly(false); }}>조건 모두 지우기</button> : null}
-          {selectedRegion ? <section className="region-note"><small>{selectedRegion.island}</small><h3>{selectedRegion.name_ko}</h3>{selectedCondition ? <b>{Math.round(selectedCondition.temperature_c)}° · {selectedCondition.summary} · 바람 {Math.round(selectedCondition.wind_kph)}km/h</b> : null}<p>{selectedRegion.summary}</p><span>⇄ {selectedRegion.access_note}</span></section> : <section className="region-note region-note--all"><small>ALL ISLANDS</small><h3>전체 지도</h3><p>발리는 작지만 동서 이동과 섬 간 배편은 시간이 걸립니다. 먼저 전체를 둘러보고 필요한 권역만 필터로 좁혀보세요.</p><span>현재 {conditions.length ? conditions.length + "개 권역의 날씨가 갱신됨" : "첫 운영 배치 대기 중"}</span></section>}
+          {selectedRegion ? <section className="region-note"><small>{selectedRegion.island}</small><h3>{selectedRegion.name_ko}</h3>{selectedCondition ? <b className={selectedCondition.is_stale ? "stale" : ""}>{Math.round(selectedCondition.temperature_c)}° · {selectedCondition.summary} · 바람 {Math.round(selectedCondition.wind_kph)}km/h{selectedCondition.is_stale ? " · 갱신 필요" : ""}</b> : null}<p>{selectedRegion.summary}</p><span>⇄ {selectedRegion.access_note}</span></section> : <section className="region-note region-note--all"><small>ALL ISLANDS</small><h3>전체 지도</h3><p>발리는 작지만 동서 이동과 섬 간 배편은 시간이 걸립니다. 먼저 전체를 둘러보고 필요한 권역만 필터로 좁혀보세요.</p><span>현재 {conditions.length ? conditions.filter((item) => !item.is_stale).length + "개 권역의 최신 날씨" + (conditions.some((item) => item.is_stale) ? " · 일부 갱신 필요" : "") : "첫 운영 배치 대기 중"}</span></section>}
         </aside>
 
         <section className="map-stage">
@@ -481,19 +889,32 @@ export default function App() {
             </div>
           ) : null}
           {error ? <p className="floating-error">{error}<button type="button" onClick={() => setError("")}>×</button></p> : null}
-          <MapContainer center={[-8.55, 115.55]} zoom={9} zoomControl={false}>
+          <MapContainer center={[initialMapView.lat, initialMapView.lng]} zoom={initialMapView.zoom} zoomControl={false}>
             <TileLayer
               attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
               url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
             />
-            <MapViewport region={selectedRegion} focus={focus} />
-            {places.map((place) => (
-              <Marker key={place.id} position={[place.lat, place.lng]} icon={markerIcon(place.category, selected?.id === place.id)} eventHandlers={{ click: () => selectPlace(place) }}>
-                <Tooltip direction="top" offset={[0, -30]}><strong>{place.title}</strong><br /><small>{place.best_time}</small></Tooltip>
-              </Marker>
-            ))}
+            <MapViewport
+              region={selectedRegion}
+              focus={focus}
+              preserveInitialView={initialMapView.restored}
+              initialRegionId={initialRegionId}
+            />
+            <MapViewPersistence />
+            <UserLocationControl />
+            <PlaceMarkerLayer places={places} selected={selected} onSelect={selectPlace} />
+            <WeatherMarkerLayer items={regionalConditions} selectedRegionId={selectedRegionId} onSelectRegion={chooseRegion} />
           </MapContainer>
           <div className="map-count"><strong>{places.length}</strong><span>{loading ? "불러오는 중" : "곳을 보고 있어요"}</span></div>
+          {!selectedRegion ? (
+            <div className="map-weather-key" role="status" aria-live="polite">
+              <span aria-hidden="true">☀</span>
+              <span>
+                <strong>권역별 현재 날씨</strong>
+                <small>{regionalConditions.length ? regionalConditions.length + "곳 · 날씨 마커를 누르면 권역 선택" : "날씨를 불러오는 중"}</small>
+              </span>
+            </div>
+          ) : null}
 
           <section className="place-ribbon">
             {places.slice(0, 12).map((place) => {
@@ -516,6 +937,8 @@ export default function App() {
               onClose={() => { setSelected(null); setFocus(null); }}
               onFavorite={() => void toggleFavorite(selected)}
               onTrip={() => void addToTrip(selected)}
+              onItinerary={openItinerary}
+              onCollaborate={() => { setCollaborationOpen(true); setItineraryOpen(false); setTripOpen(false); setChatOpen(false); }}
             />
           ) : null}
         </section>
@@ -530,8 +953,28 @@ export default function App() {
           onDelete={(stopId) => void removeTripStop(stopId)}
         />
       ) : null}
+      {itineraryOpen ? (
+        <ItineraryPanel
+          token={token}
+          places={itineraryPlaces.length ? itineraryPlaces : places}
+          initialPlace={selected}
+          onClose={() => setItineraryOpen(false)}
+        />
+      ) : null}
+      {collaborationOpen && selected ? (
+        <aside className="place-collab-drawer">
+          <PlaceCollaboration
+            token={token}
+            placeId={selected.id}
+            currentUserId={user.id}
+            isAdmin={user.is_admin}
+            placeTitle={selected.title}
+            onClose={() => setCollaborationOpen(false)}
+          />
+        </aside>
+      ) : null}
       {chatOpen ? <ChatPanel token={token} region={selectedRegion} selected={selected} places={places} onClose={() => setChatOpen(false)} onOpenPlace={(place) => { setSelected(place); setFocus({ lat: place.lat, lng: place.lng }); setChatOpen(false); }} /> : null}
-      {(tripOpen || chatOpen || filtersOpen) ? <button className="scrim" type="button" onClick={() => { setTripOpen(false); setChatOpen(false); setFiltersOpen(false); }} aria-label="패널 닫기" /> : null}
+      {(tripOpen || itineraryOpen || collaborationOpen || chatOpen || filtersOpen) ? <button className="scrim" type="button" onClick={() => { setTripOpen(false); setItineraryOpen(false); setCollaborationOpen(false); setChatOpen(false); setFiltersOpen(false); }} aria-label="패널 닫기" /> : null}
     </div>
   );
 }

@@ -94,3 +94,39 @@ resource "aws_cloudwatch_event_target" "batch" {
 
   depends_on = [aws_iam_role_policy.events]
 }
+
+# Bali time 03:30 (UTC 19:30). Discovery only creates review candidates;
+# it never publishes a place without an administrator approval.
+resource "aws_cloudwatch_event_rule" "discovery" {
+  name                = "cloudbali-prod-discovery-daily"
+  description         = "Discover reviewable Bali-area place candidates once a day"
+  schedule_expression = "cron(30 19 * * ? *)"
+}
+
+resource "aws_cloudwatch_event_target" "discovery" {
+  rule      = aws_cloudwatch_event_rule.discovery.name
+  target_id = "cloudbali-place-discovery"
+  arn       = data.aws_ecs_cluster.shared.arn
+  role_arn  = aws_iam_role.events.arn
+  input = jsonencode({
+    containerOverrides = [{
+      name    = "batch"
+      command = ["python", "-m", "app.discovery", "--limit", "60"]
+    }]
+  })
+
+  ecs_target {
+    task_count          = 1
+    task_definition_arn = aws_ecs_task_definition.batch.arn
+    launch_type         = "FARGATE"
+    platform_version    = "LATEST"
+
+    network_configuration {
+      subnets          = var.public_subnet_ids
+      security_groups  = [aws_security_group.ecs.id]
+      assign_public_ip = true
+    }
+  }
+
+  depends_on = [aws_iam_role_policy.events]
+}
