@@ -8,12 +8,14 @@
 
 - 주소: https://d99vh81lujruy.cloudfront.net
 - GitHub: https://github.com/juranikr/cloudbali
-- 자동 배포: `main` 브랜치의 앱 코드 변경 시 테스트 → ECR 이미지 푸시 → ECS 무중단 교체 → 운영 헬스체크
+- 운영 상태: 비용 절감을 위한 휴면 모드(API 태스크 0, 예약 작업 중지)
+- 자동 배포: 휴면 중에는 `DEPLOY_ENABLED=false`로 차단하며, 재개 후 `main` 브랜치의 앱 코드 변경 시 테스트 → ECR 이미지 푸시 → ECS 무중단 교체 → 운영 헬스체크
 - 관리자 계정: `joohan92@naver.com`, `tjwjd629@naver.com`
 - 비밀번호: 두 계정은 같은 운영 비밀번호를 사용하며 AWS Secrets Manager에만 보관합니다.
 - 관리자 화면: 두 계정 중 하나로 로그인한 뒤 상단의 `관리자` 버튼 또는 `/admin`
 
 운영 환경은 CloudFront → 공유 ALB → 전용 ECS 서비스 → PostgreSQL의 `cloudbali` 데이터베이스로 구성됩니다. 기존 Cloudmiddle의 서비스와 데이터베이스는 변경하지 않습니다.
+휴면·재개 절차는 [HIBERNATION.md](HIBERNATION.md)에 있습니다.
 
 ## 바로 실행
 

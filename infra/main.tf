@@ -256,7 +256,7 @@ resource "aws_ecs_service" "app" {
   name            = "cloudbali-prod-api"
   cluster         = data.aws_ecs_cluster.shared.arn
   task_definition = aws_ecs_task_definition.app.arn
-  desired_count   = var.desired_count
+  desired_count   = var.api_enabled ? var.desired_count : 0
   launch_type     = "FARGATE"
   network_configuration {
     subnets          = var.public_subnet_ids

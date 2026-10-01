@@ -81,7 +81,7 @@ jobs:
 
   deploy:
     needs: [changes, validate]
-    if: ${{ (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') || (github.event_name == 'push' && needs.changes.outputs.app == 'true') }}
+    if: ${{ vars.DEPLOY_ENABLED == 'true' && ((github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') || (github.event_name == 'push' && needs.changes.outputs.app == 'true')) }}
     runs-on: ubuntu-latest
     permissions:
       id-token: write

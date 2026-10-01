@@ -79,6 +79,7 @@ resource "aws_cloudwatch_event_rule" "batch" {
   name                = "cloudbali-prod-batch-6h"
   description         = "Refresh Bali traveler conditions every six hours"
   schedule_expression = "rate(6 hours)"
+  state               = var.scheduled_jobs_enabled ? "ENABLED" : "DISABLED"
 }
 
 resource "aws_cloudwatch_event_target" "batch" {
@@ -110,6 +111,7 @@ resource "aws_cloudwatch_event_rule" "discovery" {
   name                = "cloudbali-prod-discovery-daily"
   description         = "Discover reviewable Bali-area place candidates once a day"
   schedule_expression = "cron(30 19 * * ? *)"
+  state               = var.scheduled_jobs_enabled ? "ENABLED" : "DISABLED"
 }
 
 resource "aws_cloudwatch_event_target" "discovery" {

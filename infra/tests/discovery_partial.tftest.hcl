@@ -62,3 +62,48 @@ run "discovery_partial_alert_contract" {
     error_message = "The partial alarm must keep exactly one operations notification action."
   }
 }
+
+run "hibernation_contract" {
+  command = plan
+
+  variables {
+    api_enabled            = false
+    scheduled_jobs_enabled = false
+    desired_count          = 1
+  }
+
+  assert {
+    condition     = aws_ecs_service.app.desired_count == 0
+    error_message = "Hibernation must scale the API service to zero tasks."
+  }
+
+  assert {
+    condition     = aws_cloudwatch_event_rule.batch.state == "DISABLED"
+    error_message = "Hibernation must disable the six-hour conditions batch."
+  }
+
+  assert {
+    condition     = aws_cloudwatch_event_rule.discovery.state == "DISABLED"
+    error_message = "Hibernation must disable the daily discovery schedule."
+  }
+}
+
+run "active_runtime_contract" {
+  command = plan
+
+  variables {
+    api_enabled            = true
+    scheduled_jobs_enabled = true
+    desired_count          = 1
+  }
+
+  assert {
+    condition     = aws_ecs_service.app.desired_count == 1
+    error_message = "Reactivation must restore the configured API task count."
+  }
+
+  assert {
+    condition     = aws_cloudwatch_event_rule.batch.state == "ENABLED" && aws_cloudwatch_event_rule.discovery.state == "ENABLED"
+    error_message = "Reactivation must restore both scheduled jobs."
+  }
+}

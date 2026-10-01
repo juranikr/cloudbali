@@ -5,6 +5,10 @@ data "aws_cloudfront_cache_policy" "place_images" {
 resource "aws_s3_bucket" "place_images" {
   bucket        = "cloudbali-prod-place-images-${data.aws_caller_identity.current.account_id}"
   force_destroy = false
+
+  lifecycle {
+    prevent_destroy = true
+  }
 }
 
 resource "aws_s3_bucket_public_access_block" "place_images" {

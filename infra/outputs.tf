@@ -45,6 +45,11 @@ output "operations_alert_topic_arn" {
   value = aws_sns_topic.operations_alerts.arn
 }
 
+output "archive_bucket" {
+  description = "Private versioned bucket for hibernation database and code recovery artifacts."
+  value       = aws_s3_bucket.archive.bucket
+}
+
 output "place_image_bucket" {
   value = aws_s3_bucket.place_images.bucket
 }

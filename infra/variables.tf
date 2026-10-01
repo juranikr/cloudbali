@@ -32,8 +32,20 @@ variable "ecs_cluster_name" {
 }
 variable "desired_count" {
   type        = number
-  description = "Keep at 0 until the first image is pushed."
+  description = "Number of API tasks to run while api_enabled is true."
   default     = 0
+}
+
+variable "api_enabled" {
+  type        = bool
+  description = "Run the Cloudbali API service. Disable this to preserve the service definition while hibernating all API tasks."
+  default     = true
+}
+
+variable "scheduled_jobs_enabled" {
+  type        = bool
+  description = "Run the six-hour conditions batch and daily discovery schedule. Keep disabled until the API has been restored and verified."
+  default     = true
 }
 variable "app_name" {
   type    = string
